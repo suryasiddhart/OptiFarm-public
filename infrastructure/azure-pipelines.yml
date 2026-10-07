@@ -1,0 +1,827 @@
+# FarmApp — Terraform Infrastructure Pipeline
+#
+# Deploys Azure resources defined in FarmApp/infrastructure/terraform/
+# using a Terraform Cloud (TFC) remote backend.
+#
+# ─────────────────────────────────────────────
+# SECURITY: Workload Identity Federation (WIF)
+# ─────────────────────────────────────────────
+# ARM authentication uses Workload Identity Federation (OIDC) — no
+# persistent client secrets. The AzureCLI@2 task handles the OIDC
+# token exchange internally, and we obtain a valid ARM access token
+# via `az account get-access-token` for the azurerm provider.
+#
+# Service connection setup (one-time, in Azure DevOps):
+#   Project Settings → Service Connections → New
+#   → Azure Resource Manager
+#   → Workload Identity Federation (automatic)
+# This auto-creates the Azure AD app registration + federated
+# credential. No secret is ever stored or rotated.
+#
+# The azurerm provider receives:
+#   ARM_ACCESS_TOKEN=<token> → valid ARM bearer token from az cli
+#   ARM_SUBSCRIPTION_ID, ARM_TENANT_ID from the az account
+# (No ARM_OIDC_TOKEN, ARM_USE_OIDC, or ARM_CLIENT_ID needed)
+#
+# ─────────────────────────────────────────────
+# Stages
+# ─────────────────────────────────────────────
+#   1. Validate          — fmt check, tfsec scan, init, validate (PR + push)
+#   2. Plan              — terraform plan, publish plan artifact (PR + push)
+#   3. ApplyDev          — apply to dev (merge to develop, env approval)
+#   4. InstallK3sDev      — install k3s + nginx ingress + namespaces + ESO + cert-manager on dev VM, store kubeconfig in KV
+#   5. ApplyStaging      — apply to staging (merge to main, env approval)
+#   6. InstallK3sStaging — install k3s + nginx ingress + namespaces + ESO + cert-manager on staging VM, store kubeconfig in KV
+#   7. ApplyProd         — apply to prod (merge to main, env approval)
+#   8. InstallK3sProd    — install k3s + nginx ingress + namespaces + ESO + cert-manager on prod VM, store kubeconfig in KV
+#   9. Destroy           — manual destroy (approval-gated, env-scoped)
+#
+# ─────────────────────────────────────────────
+# Prerequisites
+# ─────────────────────────────────────────────
+# Variable group `optifarm-terraform-variables`:
+#   - TFE_TOKEN       (secret)  — Terraform Cloud API token
+#   - resource_grp    (string)  — Azure resource group name
+#   - location        (string)  — Azure region
+#   - create_acr      (bool)    — feature flag
+#   - create_keyvault (bool)    — feature flag
+#   - create_vm       (bool)    — feature flag
+#   - create_aks      (bool)    — feature flag
+#   - vm_name         (string)  — VM resource name for k3s install (e.g. optifarm-vm)
+#   - key_vault_name  (string)  — Key Vault name for kubeconfig storage and the
+#                                  ESO ClusterSecretStore (e.g. optifarm-kv1)
+#
+# Terraform outputs consumed by the InstallK3s* stages:
+#   - workload_identity_client_id — VM user-assigned identity used by ESO
+#                                   (Key Vault Secrets User + AcrPull)
+#   - acr_login_server            — registry for the ESO ACR token generator
+#
+# Service connection `terraform-arm-connection`:
+#   - Type: Azure Resource Manager
+#   - Auth: Workload Identity Federation (automatic)
+#   - Role: Contributor on target subscription (or scoped RG)
+#     + User Access Administrator / Owner (Terraform creates role
+#       assignments for Key Vault and the VM workload identity)
+
+# ─────────────────────────────────────────────
+# Triggers
+# ─────────────────────────────────────────────
+trigger:
+  branches:
+    include:
+      - develop
+      - main
+  paths:
+    include:
+      - infrastructure/terraform/*
+      - infrastructure/ansible/*
+      - infrastructure/azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - develop
+      - main
+  paths:
+    include:
+      - infrastructure/terraform/*
+      - infrastructure/ansible/*
+      - infrastructure/azure-pipelines.yml
+
+# ─────────────────────────────────────────────
+# Variables
+# ─────────────────────────────────────────────
+variables:
+  - group: optifarm-terraform-variables   # TFE_TOKEN (secret), resource_grp, flags
+  - name: tfWorkingDir
+    value: "$(Build.SourcesDirectory)/infrastructure/terraform"
+  - name: armServiceConnection
+    value: "terraform-arm-connection"
+  - name: tfPlanArtifact
+    value: "terraform-plan"
+  - name: terraformVersion
+    value: "1.15.8"
+  - name: tfsecVersion
+    value: "v1.28.1"
+  - name: system.debug
+    value: "true"
+  - name: ansibleDir
+    value: "$(Build.SourcesDirectory)/infrastructure/ansible"
+
+# ─────────────────────────────────────────────
+# Stages
+# ─────────────────────────────────────────────
+stages:
+
+  # ─────────────────────────────────────────────
+  # STAGE 1: Validate
+  # ─────────────────────────────────────────────
+  - stage: Validate
+    displayName: "Terraform Validate & Security Scan"
+    jobs:
+      - job: Validate
+        displayName: "Format Check, tfsec Scan & Validate"
+        pool:
+          name: Exp-Agent
+        steps:
+          - checkout: self
+
+          - task: Bash@3
+            displayName: "Install Terraform"
+            inputs:
+              targetType: 'inline'
+              script: |
+                if ! command -v terraform &>/dev/null; then
+                  curl -fsSL "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip" -o /tmp/tf.zip
+                  unzip -o /tmp/tf.zip -d /usr/local/bin/
+                  chmod +x /usr/local/bin/terraform
+                fi
+                terraform version
+
+          - task: Bash@3
+            displayName: "Terraform Format Check"
+            inputs:
+              targetType: 'inline'
+              workingDirectory: "$(tfWorkingDir)"
+              script: |
+                terraform fmt -check -recursive
+                echo "✓ Format check passed"
+
+          - task: Bash@3
+            displayName: "Install tfsec & Run Security Scan"
+            inputs:
+              targetType: 'inline'
+              workingDirectory: "$(tfWorkingDir)"
+              script: |
+                # Install tfsec
+                curl -fsSL "https://github.com/aquasecurity/tfsec/releases/download/$(tfsecVersion)/tfsec-linux-amd64" \
+                  -o /tmp/tfsec
+                chmod +x /tmp/tfsec
+                # Run security scan (non-blocking warnings, blocking on HIGH/CRITICAL)
+                /tmp/tfsec . --severity high,critical --soft-fail=false
+                echo "✓ tfsec security scan passed"
+
+          - task: Bash@3
+            displayName: "Terraform Init"
+            inputs:
+              targetType: 'inline'
+              workingDirectory: "$(tfWorkingDir)"
+              script: |
+                terraform init
+            env:
+              TFE_TOKEN: $(TFE_TOKEN)
+
+          - task: Bash@3
+            displayName: "Terraform Validate"
+            inputs:
+              targetType: 'inline'
+              workingDirectory: "$(tfWorkingDir)"
+              script: |
+                terraform validate
+                echo "✓ Validate passed"
+
+  # ─────────────────────────────────────────────
+  # STAGE 2: Plan
+  # ─────────────────────────────────────────────
+  - stage: Plan
+    displayName: "Terraform Plan"
+    dependsOn: Validate
+    jobs:
+      - job: Plan
+        displayName: "Generate Terraform Plan"
+        pool:
+          name: Exp-Agent
+        steps:
+          - checkout: self
+
+          - task: Bash@3
+            displayName: "Install Terraform"
+            inputs:
+              targetType: 'inline'
+              script: |
+                if ! command -v terraform &>/dev/null; then
+                  curl -fsSL "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip" -o /tmp/tf.zip
+                  unzip -o /tmp/tf.zip -d /usr/local/bin/
+                  chmod +x /usr/local/bin/terraform
+                fi
+                terraform version
+
+          # Run init + plan inside AzureCLI — WIF handles auth internally,
+          # we extract a valid ARM access token via az account get-access-token
+          - task: AzureCLI@2
+            displayName: "Terraform Init & Plan"
+            inputs:
+              azureSubscription: $(armServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -x  # Trace every command for debugging
+                # Obtain valid ARM access token via authenticated az cli
+                export ARM_ACCESS_TOKEN=$(az account get-access-token --query accessToken -o tsv)
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                export ARM_TENANT_ID=$(az account show --query tenantId -o tsv)
+
+                cd "$(tfWorkingDir)"
+
+                # Initialize (TFC remote backend)
+                terraform init
+                echo "✓ Terraform init complete"
+
+                # Generate plan with feature flags
+                terraform plan \
+                  -out=$(tfPlanArtifact) \
+                  -var="resource_grp=$(resource_grp)" \
+                  -var="create_acr=$(create_acr)" \
+                  -var="create_keyvault=$(create_keyvault)" \
+                  -var="create_vm=$(create_vm)" \
+                  -var="create_aks=$(create_aks)"
+                echo "✓ Terraform plan generated"
+            env:
+              TFE_TOKEN: $(TFE_TOKEN)
+              TF_LOG: DEBUG
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Terraform Plan"
+            inputs:
+              targetPath: "$(tfWorkingDir)/$(tfPlanArtifact)"
+              artifact: $(tfPlanArtifact)
+              publishLocation: pipeline
+
+  # ─────────────────────────────────────────────
+  # STAGE 3: Apply Dev
+  # ─────────────────────────────────────────────
+  - stage: ApplyDev
+    displayName: "Terraform Apply — Dev"
+    dependsOn: Plan
+    condition: |
+      and(
+        succeeded(),
+        eq(variables['Build.SourceBranch'], 'refs/heads/develop')
+      )
+    jobs:
+      - deployment: ApplyDev
+        displayName: "Apply Terraform to Dev"
+        pool:
+          name: Exp-Agent
+        environment: "terraform-dev"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: Bash@3
+                  displayName: "Install Terraform"
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      if ! command -v terraform &>/dev/null; then
+                        curl -fsSL "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip" -o /tmp/tf.zip
+                        unzip -o /tmp/tf.zip -d /usr/local/bin/
+                        chmod +x /usr/local/bin/terraform
+                      fi
+                      terraform version
+
+                - task: DownloadPipelineArtifact@2
+                  displayName: "Download Terraform Plan"
+                  inputs:
+                    buildType: 'current'
+                    artifactName: $(tfPlanArtifact)
+                    targetPath: "$(tfWorkingDir)"
+
+                - task: AzureCLI@2
+                  displayName: "Terraform Init & Apply — Dev"
+                  inputs:
+                    azureSubscription: $(armServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -x  # Trace every command for debugging
+                      # Obtain valid ARM access token via authenticated az cli
+                      export ARM_ACCESS_TOKEN=$(az account get-access-token --query accessToken -o tsv)
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                      export ARM_TENANT_ID=$(az account show --query tenantId -o tsv)
+
+                      cd "$(tfWorkingDir)"
+
+                      # Initialize (TFC remote backend)
+                      terraform init
+                      echo "✓ Terraform init complete"
+
+                      # Apply the pre-generated plan
+                      terraform apply -auto-approve "$(tfPlanArtifact)"
+                      echo "✓ Terraform apply complete (Dev)"
+                  env:
+                    TFE_TOKEN: $(TFE_TOKEN)
+                    TF_LOG: DEBUG
+
+  # ─────────────────────────────────────────────
+  # STAGE 4: Install k3s + Nginx Ingress + ESO + cert-manager — Dev
+  # ─────────────────────────────────────────────
+  # Runs after ApplyDev succeeds. Installs k3s (traefik disabled) and
+  # nginx ingress controller on the dev VM via Ansible (SSH-based), creates
+  # the optifarm-* namespaces and installs External Secrets Operator with a
+  # ClusterSecretStore backed by Key Vault, plus cert-manager with the
+  # Let's Encrypt ClusterIssuers (letsencrypt, letsencrypt-test).
+  # Stores the kubeconfig as a Key Vault secret for use by app pipelines.
+  - stage: InstallK3sDev
+    displayName: "Install k3s + Nginx Ingress — Dev"
+    dependsOn: ApplyDev
+    condition: |
+      and(
+        succeeded(),
+        eq(variables['create_vm'], 'true'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/develop')
+      )
+    jobs:
+      - deployment: InstallK3sDev
+        displayName: "Install k3s on Dev VM via Ansible"
+        pool:
+          name: Exp-Agent
+        environment: "terraform-dev"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: Bash@3
+                  displayName: "Install Terraform & Ansible"
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      # Install Terraform
+                      if ! command -v terraform &>/dev/null; then
+                        curl -fsSL "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip" -o /tmp/tf.zip
+                        unzip -o /tmp/tf.zip -d /usr/local/bin/
+                        chmod +x /usr/local/bin/terraform
+                      fi
+                      terraform version
+
+                      # Install Ansible
+                      pip3 install ansible
+                      ansible --version
+
+                - task: AzureCLI@2
+                  displayName: "Install k3s + Nginx Ingress on Dev VM via Ansible"
+                  inputs:
+                    azureSubscription: $(armServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      # ── Get VM public IP ──
+                      PUBLIC_IP=$(az vm show \
+                        --resource-group "$(resource_grp)" \
+                        --name "$(vm_name)" \
+                        --show-details \
+                        --query publicIps \
+                        -o tsv)
+
+                      if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "null" ]; then
+                        echo "✗ Could not retrieve VM public IP"
+                        exit 1
+                      fi
+                      echo "→ VM Public IP: ${PUBLIC_IP}"
+
+                      # ── Retrieve SSH private key from Terraform output ──
+                      echo "→ Retrieving SSH private key from Terraform output…"
+                      cd "$(tfWorkingDir)"
+                      terraform init
+                      terraform output -raw tls_private_key > /tmp/vm_ssh_key
+                      chmod 600 /tmp/vm_ssh_key
+                      echo "✓ SSH private key retrieved"
+
+                      # ── Workload identity + ACR for External Secrets Operator ──
+                      ESO_IDENTITY_CLIENT_ID=$(terraform output -raw workload_identity_client_id)
+                      ACR_LOGIN_SERVER=$(terraform output -raw acr_login_server)
+                      echo "→ ESO identity client ID: ${ESO_IDENTITY_CLIENT_ID}, ACR: ${ACR_LOGIN_SERVER}"
+
+                      # ── Generate Ansible inventory ──
+                      cat > /tmp/hosts.ini <<EOF
+                      [k3s_nodes]
+                      ${PUBLIC_IP} ansible_user=azureuser ansible_ssh_private_key_file=/tmp/vm_ssh_key
+                      EOF
+                      echo "→ Ansible inventory:"
+                      cat /tmp/hosts.ini
+
+                      # ── Run Ansible playbook ──
+                      echo "→ Running Ansible playbook…"
+                      ansible-playbook -i /tmp/hosts.ini \
+                        "$(ansibleDir)/playbooks/install-k3s-stack.yml" \
+                        --extra-vars "public_ip=${PUBLIC_IP} key_vault_name=$(key_vault_name) eso_identity_client_id=${ESO_IDENTITY_CLIENT_ID} acr_login_server=${ACR_LOGIN_SERVER}" -vv
+
+                      # ── Store kubeconfig in Key Vault ──
+                      KUBECONFIG_CONTENT=$(cat /tmp/kubeconfig.yaml)
+                      if [ -z "$KUBECONFIG_CONTENT" ]; then
+                        echo "✗ Failed to fetch kubeconfig from VM"
+                        exit 1
+                      fi
+                      echo "✓ Kubeconfig fetched successfully"
+
+                      echo "→ Storing kubeconfig in Key Vault '$(key_vault_name)' as secret 'kubeconfig-dev'…"
+                      az keyvault secret set \
+                        --vault-name "$(key_vault_name)" \
+                        --name "kubeconfig-dev" \
+                        --value "$KUBECONFIG_CONTENT"
+                      echo "✓ Kubeconfig stored in Key Vault as 'kubeconfig-dev'"
+
+                      # ── Verify k3s is accessible using the kubeconfig ──
+                      echo "→ Verifying k3s node is Ready using fetched kubeconfig…"
+                      export KUBECONFIG=/tmp/kubeconfig.yaml
+
+                      kubectl get nodes -o wide
+                      NODE_STATUS=$(kubectl get nodes -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}')
+                      if [ "$NODE_STATUS" = "True" ]; then
+                        echo "✓ k3s node is Ready"
+                      else
+                        echo "✗ k3s node is NOT Ready (status: $NODE_STATUS)"
+                        exit 1
+                      fi
+
+                      # ── Verify nginx ingress controller ──
+                      echo "→ Verifying nginx ingress controller…"
+                      kubectl get pods -n kube-system -l app.kubernetes.io/name=ingress-nginx -o wide
+                      echo "✓ nginx ingress controller verified"
+
+                      # ── Verify External Secrets Operator + ClusterSecretStore ──
+                      echo "→ Verifying External Secrets Operator…"
+                      kubectl get pods -n external-secrets -o wide
+                      kubectl get clustersecretstore azure-keyvault
+                      kubectl get pods -n cert-manager -o wide
+                      kubectl get clusterissuer letsencrypt letsencrypt-test
+                      kubectl get namespaces -l kubernetes.io/metadata.name -o name | grep optifarm-
+                      kubectl get externalsecret,secret acr-pull-secret -n optifarm-dev
+                      echo "✓ External Secrets Operator verified"
+
+                      rm -f /tmp/vm_ssh_key /tmp/kubeconfig.yaml
+                      echo "✓ Install k3s + Nginx Ingress (Dev) complete"
+                  env:
+                    TFE_TOKEN: $(TFE_TOKEN)
+
+  # ─────────────────────────────────────────────
+  # STAGE 5: Apply Staging
+  # ─────────────────────────────────────────────
+  - stage: ApplyStaging
+    displayName: "Terraform Apply — Staging"
+    dependsOn: Plan
+    condition: |
+      and(
+        succeeded(),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      )
+    jobs:
+      - deployment: ApplyStaging
+        displayName: "Apply Terraform to Staging"
+        pool:
+          name: Exp-Agent
+        environment: "terraform-staging"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: Bash@3
+                  displayName: "Install Terraform"
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      if ! command -v terraform &>/dev/null; then
+                        curl -fsSL "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip" -o /tmp/tf.zip
+                        unzip -o /tmp/tf.zip -d /usr/local/bin/
+                        chmod +x /usr/local/bin/terraform
+                      fi
+                      terraform version
+
+                - task: DownloadPipelineArtifact@2
+                  displayName: "Download Terraform Plan"
+                  inputs:
+                    buildType: 'current'
+                    artifactName: $(tfPlanArtifact)
+                    targetPath: "$(tfWorkingDir)"
+
+                - task: AzureCLI@2
+                  displayName: "Terraform Init & Apply — Staging"
+                  inputs:
+                    azureSubscription: $(armServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -x  # Trace every command for debugging
+                      # Obtain valid ARM access token via authenticated az cli
+                      export ARM_ACCESS_TOKEN=$(az account get-access-token --query accessToken -o tsv)
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                      export ARM_TENANT_ID=$(az account show --query tenantId -o tsv)
+
+                      cd "$(tfWorkingDir)"
+
+                      # Initialize (TFC remote backend)
+                      terraform init
+                      echo "✓ Terraform init complete"
+
+                      # Apply the pre-generated plan
+                      terraform apply -auto-approve "$(tfPlanArtifact)"
+                      echo "✓ Terraform apply complete (Staging)"
+                  env:
+                    TFE_TOKEN: $(TFE_TOKEN)
+                    TF_LOG: DEBUG
+
+  # ─────────────────────────────────────────────
+  # STAGE 6: Install k3s + Nginx Ingress + ESO + cert-manager — Staging
+  # ─────────────────────────────────────────────
+  # Runs after ApplyStaging succeeds. Installs k3s (traefik disabled) and
+  # nginx ingress controller, ESO and cert-manager on the staging VM via Ansible.
+  # Stores the kubeconfig as a Key Vault secret for use by app pipelines.
+  - stage: InstallK3sStaging
+    displayName: "Install k3s + Nginx Ingress — Staging"
+    dependsOn: ApplyStaging
+    condition: |
+      and(
+        succeeded(),
+        eq(variables['create_vm'], 'true'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      )
+    jobs:
+      - deployment: InstallK3sStaging
+        displayName: "Install k3s on Staging VM via Ansible"
+        pool:
+          name: Exp-Agent
+        environment: "terraform-staging"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: Bash@3
+                  displayName: "Install Terraform & Ansible"
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      if ! command -v terraform &>/dev/null; then
+                        curl -fsSL "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip" -o /tmp/tf.zip
+                        unzip -o /tmp/tf.zip -d /usr/local/bin/
+                        chmod +x /usr/local/bin/terraform
+                      fi
+                      terraform version
+                      pip3 install ansible
+                      ansible --version
+
+                - task: AzureCLI@2
+                  displayName: "Install k3s + Nginx Ingress on Staging VM via Ansible"
+                  inputs:
+                    azureSubscription: $(armServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      PUBLIC_IP=$(az vm show --resource-group "$(resource_grp)" --name "$(vm_name)" --show-details --query publicIps -o tsv)
+                      if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "null" ]; then echo "✗ No public IP"; exit 1; fi
+                      echo "→ VM Public IP: ${PUBLIC_IP}"
+
+                      cd "$(tfWorkingDir)"
+                      terraform init
+                      terraform output -raw tls_private_key > /tmp/vm_ssh_key
+                      chmod 600 /tmp/vm_ssh_key
+                      ESO_IDENTITY_CLIENT_ID=$(terraform output -raw workload_identity_client_id)
+                      ACR_LOGIN_SERVER=$(terraform output -raw acr_login_server)
+
+                      cat > /tmp/hosts.ini <<EOF
+                      [k3s_nodes]
+                      ${PUBLIC_IP} ansible_user=azureuser ansible_ssh_private_key_file=/tmp/vm_ssh_key
+                      EOF
+
+                      ansible-playbook -i /tmp/hosts.ini "$(ansibleDir)/playbooks/install-k3s-stack.yml" --extra-vars "public_ip=${PUBLIC_IP} key_vault_name=$(key_vault_name) eso_identity_client_id=${ESO_IDENTITY_CLIENT_ID} acr_login_server=${ACR_LOGIN_SERVER}" -vv
+
+                      KUBECONFIG_CONTENT=$(cat /tmp/kubeconfig.yaml)
+                      if [ -z "$KUBECONFIG_CONTENT" ]; then echo "✗ Failed to fetch kubeconfig"; exit 1; fi
+                      echo "$KUBECONFIG_CONTENT" | az keyvault secret set --vault-name "$(key_vault_name)" --name "kubeconfig-staging" --file - > /dev/null
+                      echo "✓ Kubeconfig stored in Key Vault as 'kubeconfig-staging'"
+
+                      export KUBECONFIG=/tmp/kubeconfig.yaml
+                      kubectl get nodes -o wide
+                      kubectl get pods -n kube-system -l app.kubernetes.io/name=ingress-nginx -o wide
+                      kubectl get pods -n external-secrets -o wide
+                      kubectl get clustersecretstore azure-keyvault
+                      kubectl get pods -n cert-manager -o wide
+                      kubectl get clusterissuer letsencrypt letsencrypt-test
+                      kubectl get externalsecret,secret acr-pull-secret -n optifarm-staging
+                      rm -f /tmp/vm_ssh_key /tmp/kubeconfig.yaml
+                      echo "✓ Install k3s + Nginx Ingress (Staging) complete"
+                  env:
+                    TFE_TOKEN: $(TFE_TOKEN)
+
+  # ─────────────────────────────────────────────
+  # STAGE 7: Apply Prod
+  # ─────────────────────────────────────────────
+  - stage: ApplyProd
+    displayName: "Terraform Apply — Prod"
+    dependsOn: ApplyStaging
+    condition: |
+      and(
+        succeeded(),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      )
+    jobs:
+      - deployment: ApplyProd
+        displayName: "Apply Terraform to Prod"
+        pool:
+          name: Exp-Agent
+        environment: "terraform-prod"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: Bash@3
+                  displayName: "Install Terraform"
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      if ! command -v terraform &>/dev/null; then
+                        curl -fsSL "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip" -o /tmp/tf.zip
+                        unzip -o /tmp/tf.zip -d /usr/local/bin/
+                        chmod +x /usr/local/bin/terraform
+                      fi
+                      terraform version
+
+                - task: DownloadPipelineArtifact@2
+                  displayName: "Download Terraform Plan"
+                  inputs:
+                    buildType: 'current'
+                    artifactName: $(tfPlanArtifact)
+                    targetPath: "$(tfWorkingDir)"
+
+                - task: AzureCLI@2
+                  displayName: "Terraform Init & Apply — Prod"
+                  inputs:
+                    azureSubscription: $(armServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -x  # Trace every command for debugging
+                      # Obtain valid ARM access token via authenticated az cli
+                      export ARM_ACCESS_TOKEN=$(az account get-access-token --query accessToken -o tsv)
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                      export ARM_TENANT_ID=$(az account show --query tenantId -o tsv)
+
+                      cd "$(tfWorkingDir)"
+
+                      # Initialize (TFC remote backend)
+                      terraform init
+                      echo "✓ Terraform init complete"
+
+                      # Apply the pre-generated plan
+                      terraform apply -auto-approve "$(tfPlanArtifact)"
+                      echo "✓ Terraform apply complete (Prod)"
+                  env:
+                    TFE_TOKEN: $(TFE_TOKEN)
+                    TF_LOG: DEBUG
+
+  # ─────────────────────────────────────────────
+  # STAGE 8: Install k3s + Nginx Ingress + ESO + cert-manager — Prod
+  # ─────────────────────────────────────────────
+  # Runs after ApplyProd succeeds. Installs k3s (traefik disabled) and
+  # nginx ingress controller, ESO and cert-manager on the prod VM via Ansible.
+  # Stores the kubeconfig as a Key Vault secret for use by app pipelines.
+  - stage: InstallK3sProd
+    displayName: "Install k3s + Nginx Ingress — Prod"
+    dependsOn: ApplyProd
+    condition: |
+      and(
+        succeeded(),
+        eq(variables['create_vm'], 'true'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      )
+    jobs:
+      - deployment: InstallK3sProd
+        displayName: "Install k3s on Prod VM via Ansible"
+        pool:
+          name: Exp-Agent
+        environment: "terraform-prod"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: Bash@3
+                  displayName: "Install Terraform & Ansible"
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      if ! command -v terraform &>/dev/null; then
+                        curl -fsSL "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip" -o /tmp/tf.zip
+                        unzip -o /tmp/tf.zip -d /usr/local/bin/
+                        chmod +x /usr/local/bin/terraform
+                      fi
+                      terraform version
+                      pip3 install ansible
+                      ansible --version
+
+                - task: AzureCLI@2
+                  displayName: "Install k3s + Nginx Ingress on Prod VM via Ansible"
+                  inputs:
+                    azureSubscription: $(armServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      PUBLIC_IP=$(az vm show --resource-group "$(resource_grp)" --name "$(vm_name)" --show-details --query publicIps -o tsv)
+                      if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "null" ]; then echo "✗ No public IP"; exit 1; fi
+                      echo "→ VM Public IP: ${PUBLIC_IP}"
+
+                      cd "$(tfWorkingDir)"
+                      terraform init
+                      terraform output -raw tls_private_key > /tmp/vm_ssh_key
+                      chmod 600 /tmp/vm_ssh_key
+                      ESO_IDENTITY_CLIENT_ID=$(terraform output -raw workload_identity_client_id)
+                      ACR_LOGIN_SERVER=$(terraform output -raw acr_login_server)
+
+                      cat > /tmp/hosts.ini <<EOF
+                      [k3s_nodes]
+                      ${PUBLIC_IP} ansible_user=azureuser ansible_ssh_private_key_file=/tmp/vm_ssh_key
+                      EOF
+
+                      ansible-playbook -i /tmp/hosts.ini "$(ansibleDir)/playbooks/install-k3s-stack.yml" --extra-vars "public_ip=${PUBLIC_IP} key_vault_name=$(key_vault_name) eso_identity_client_id=${ESO_IDENTITY_CLIENT_ID} acr_login_server=${ACR_LOGIN_SERVER}" -vv
+
+                      KUBECONFIG_CONTENT=$(cat /tmp/kubeconfig.yaml)
+                      if [ -z "$KUBECONFIG_CONTENT" ]; then echo "✗ Failed to fetch kubeconfig"; exit 1; fi
+                      echo "$KUBECONFIG_CONTENT" | az keyvault secret set --vault-name "$(key_vault_name)" --name "kubeconfig-prod" --file - > /dev/null
+                      echo "✓ Kubeconfig stored in Key Vault as 'kubeconfig-prod'"
+
+                      export KUBECONFIG=/tmp/kubeconfig.yaml
+                      kubectl get nodes -o wide
+                      kubectl get pods -n kube-system -l app.kubernetes.io/name=ingress-nginx -o wide
+                      kubectl get pods -n external-secrets -o wide
+                      kubectl get clustersecretstore azure-keyvault
+                      kubectl get pods -n cert-manager -o wide
+                      kubectl get clusterissuer letsencrypt letsencrypt-test
+                      kubectl get externalsecret,secret acr-pull-secret -n optifarm-prod
+                      rm -f /tmp/vm_ssh_key /tmp/kubeconfig.yaml
+                      echo "✓ Install k3s + Nginx Ingress (Prod) complete"
+                  env:
+                    TFE_TOKEN: $(TFE_TOKEN)
+
+  # ─────────────────────────────────────────────
+  # STAGE 9: Destroy (manual trigger only)
+  # ─────────────────────────────────────────────
+  - stage: Destroy
+    displayName: "Terraform Destroy"
+    dependsOn: []
+    condition: eq(variables['destroy'], 'true')
+    jobs:
+      - deployment: Destroy
+        displayName: "Destroy Terraform Resources"
+        pool:
+          name: Exp-Agent
+        environment: "terraform-destroy"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: Bash@3
+                  displayName: "Install Terraform"
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      if ! command -v terraform &>/dev/null; then
+                        curl -fsSL "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip" -o /tmp/tf.zip
+                        unzip -o /tmp/tf.zip -d /usr/local/bin/
+                        chmod +x /usr/local/bin/terraform
+                      fi
+                      terraform version
+
+                - task: AzureCLI@2
+                  displayName: "Terraform Init & Destroy"
+                  inputs:
+                    azureSubscription: $(armServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -x  # Trace every command for debugging
+                      # Obtain valid ARM access token via authenticated az cli
+                      export ARM_ACCESS_TOKEN=$(az account get-access-token --query accessToken -o tsv)
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                      export ARM_TENANT_ID=$(az account show --query tenantId -o tsv)
+
+                      cd "$(tfWorkingDir)"
+
+                      # Initialize (TFC remote backend)
+                      terraform init
+                      echo "✓ Terraform init complete"
+
+                      # Destroy all resources
+                      terraform destroy \
+                        -auto-approve \
+                        -var="resource_grp=$(resource_grp)" \
+                        -var="location=$(location)" \
+                        -var="create_acr=$(create_acr)" \
+                        -var="create_keyvault=$(create_keyvault)" \
+                        -var="create_vm=$(create_vm)" \
+                        -var="create_aks=$(create_aks)"
+                      echo "✓ Terraform destroy complete"
+                  env:
+                    TFE_TOKEN: $(TFE_TOKEN)
+                    TF_LOG: DEBUG

@@ -1,0 +1,43 @@
+# -- Namespace to deploy TimescaleDB into
+namespace: optifarm-dev
+
+# -- Environment name; selects the Key Vault secrets (e.g. postgres-password-dev)
+environment: dev
+
+# -- Number of replicas for the TimescaleDB StatefulSet
+replicaCount: 1
+
+image:
+  # -- TimescaleDB image repository
+  repository: timescale/timescaledb-ha
+  # -- TimescaleDB image tag
+  tag: pg18
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+
+storage:
+  # -- PVC storage size
+  size: 4Gi
+  # -- Storage class name
+  storageClassName: local-path
+
+db:
+  # -- Database name
+  # Credentials are not stored here: user and password come from Azure Key
+  # Vault (postgres-user-<environment>, postgres-password-<environment>).
+  name: farmappdb
+
+externalSecret:
+  # -- Create the ExternalSecret that syncs DB credentials from Key Vault.
+  # When disabled, create the "timescale-db-secret" Secret manually.
+  enabled: true
+  # -- ClusterSecretStore created by the infrastructure pipeline (Ansible)
+  secretStore: azure-keyvault
+  # -- How often ESO re-reads Key Vault
+  refreshInterval: 1h
+
+service:
+  # -- TimescaleDB service port
+  port: 5432
+  # -- TimescaleDB service type
+  type: ClusterIP

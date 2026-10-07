@@ -1,0 +1,31 @@
+# FarmApp — Gitleaks Configuration
+#
+# Gitleaks scans for hardcoded secrets in the codebase.
+# This config defines allowlist rules to prevent false positives
+# for known placeholder/test values.
+#
+# Usage:
+#   gitleaks detect --source . --verbose --no-git
+#   gitleaks detect --source . --verbose (if in a git repo)
+
+title = "FarmApp Gitleaks Configuration"
+
+# Extend the default ruleset
+[extend]
+useDefault = true
+
+# Allowlist for known safe values
+[allowlist]
+description = "Allowlisted values that are not real secrets"
+
+# File paths to exclude from scanning
+paths = [
+  # Test fixtures and example files
+  '''(.*)test_(.*)\.py$''',
+  '''(.*)\.example$''',
+  '''(.*)terraform\.tfvars\.example$''',
+  # Package lock files (contain hashes, not secrets)
+  '''package-lock\.json''',
+  # Git history (already scanned separately)
+  '''\.git/''',
+]

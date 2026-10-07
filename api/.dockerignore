@@ -1,0 +1,38 @@
+# =============================================================================
+# FarmApp API — Docker ignore rules
+# =============================================================================
+# Prevent local secrets and development artifacts from being copied into
+# the container image. Secrets are injected at runtime via K8s secrets.
+# =============================================================================
+
+# Local environment files (contain secrets — NEVER ship to container)
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[codz]
+*$py.class
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+coverage/
+coverage*.xml
+test-results/
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore

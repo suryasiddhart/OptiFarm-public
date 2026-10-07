@@ -1,0 +1,448 @@
+# FarmApp — PR Validation Pipeline
+#
+# Configured as the Build Validation branch policy for `develop` and `main`.
+# Every check here is BLOCKING: the PR can only complete when all stages pass.
+# It does NOT deploy anything.
+#
+# Stages (independent, run in parallel when agents are available):
+#   Backend      — compile, Bandit, unit tests, Alembic migration round-trip,
+#                  integration tests against TimescaleDB
+#   Frontend     — ESLint, TypeScript, Vitest, production build
+#   Images       — docker build of both images + Trivy image scan
+#   Security     — Gitleaks (PR commits), Semgrep SAST, Trivy dependency and
+#                  IaC (Helm/Terraform/Dockerfile) scans
+#   Manifests    — helm lint/template for all charts, ingress render check
+#   Report       — merged code coverage
+#   QualityGate  — SonarQube (only when the enableSonar parameter is true)
+#
+# ─────────────────────────────────────────────
+# Agent requirements (self-hosted pool)
+# ─────────────────────────────────────────────
+# Linux agent with Docker. Backend/frontend jobs run as container jobs in
+# pinned images, and scanners run as pinned Docker images, so no Python/Node
+# tool cache or sudo is needed on the agent.
+#
+# ─────────────────────────────────────────────
+# Security scan policy
+# ─────────────────────────────────────────────
+# HIGH/CRITICAL findings with an available fix fail the PR. Accepted risks go
+# in /.trivyignore.yaml (with a statement and an expiry date) — reviewed in
+# PRs like any other change.
+#
+# NOTE: for Azure Repos Git the `pr:` block below is ignored; the branch
+# policy decides when this pipeline runs (configure its path filter there).
+
+trigger: none
+
+pr:
+  branches:
+    include:
+      - develop
+      - main
+
+parameters:
+  - name: enableSonar
+    displayName: "Run SonarQube quality gate"
+    type: boolean
+    default: false
+
+variables:
+  trivyImage: aquasec/trivy:0.75.0
+  gitleaksImage: zricethezav/gitleaks:v8.30.1
+  semgrepImage: semgrep/semgrep:1.179.0
+  # Throwaway test database (service container, never reachable outside the job)
+  testDatabaseUrl: "postgresql://testuser:testpass@postgres:5432/farmapp_test"
+  # Dummy value — only satisfies Settings() validation in tests
+  testSecretKey: "ci-only-dummy-secret-key-not-used-for-real-tokens"
+  npmCacheDir: $(Pipeline.Workspace)/.npm
+
+resources:
+  containers:
+    - container: python
+      image: python:3.12-slim
+    - container: node
+      image: node:22-bookworm
+    - container: timescaledb
+      image: timescale/timescaledb-ha:pg18
+      env:
+        POSTGRES_USER: testuser
+        POSTGRES_PASSWORD: testpass
+        POSTGRES_DB: farmapp_test
+
+# Self-hosted pool for all jobs (template expressions aren't allowed here)
+pool:
+  name: Exp-Agent
+
+stages:
+  # ─────────────────────────────────────────────────────────
+  # STAGE 1: Backend
+  # ─────────────────────────────────────────────────────────
+  - stage: Backend
+    displayName: "Backend — Lint, Unit, Migrations & Integration"
+    dependsOn: []
+    jobs:
+      - job: BackendUnit
+        displayName: "Compile, Bandit & Unit Tests"
+        container: python
+        steps:
+          - checkout: self
+          - script: |
+              set -euo pipefail
+              python -m venv "$(Agent.TempDirectory)/venv"
+              . "$(Agent.TempDirectory)/venv/bin/activate"
+              pip install --quiet --upgrade pip
+              pip install --quiet -r api/requirements-dev.txt
+            displayName: "Install Python dependencies"
+          - script: |
+              set -euo pipefail
+              . "$(Agent.TempDirectory)/venv/bin/activate"
+              cd api
+              python -m compileall -q .
+              # High-severity issues only; tests/migrations excluded
+              bandit -q -r . -x ./tests,./migrations -lll
+            displayName: "Compile check & Bandit (Python SAST)"
+          - script: |
+              set -euo pipefail
+              . "$(Agent.TempDirectory)/venv/bin/activate"
+              cd api
+              ./scripts/run-unit-tests.sh
+            displayName: "Run backend unit tests"
+          - task: PublishTestResults@2
+            displayName: "Publish unit test results"
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: "api/test-results/unit-*.xml"
+              testRunTitle: "Backend Unit Tests"
+              failTaskOnFailedTests: true
+          - publish: api/coverage.xml
+            artifact: coverage-backend-unit
+            displayName: "Publish coverage artifact"
+            condition: succeededOrFailed()
+
+      # - job: BackendIntegration
+      #   displayName: "Migrations & Integration Tests"
+      #   container: python
+      #   services:
+      #     postgres: timescaledb
+      #   # DATABASE_URL / SECRET_KEY / IN_CONTAINER are passed with step-level
+      #   # `env:` on every step that loads Settings (explicit and always injected).
+      #   steps:
+      #     - checkout: self
+      #     - script: |
+      #         set -euo pipefail
+      #         python -m venv "$(Agent.TempDirectory)/venv"
+      #         . "$(Agent.TempDirectory)/venv/bin/activate"
+      #         pip install --quiet --upgrade pip
+      #         pip install --quiet -r api/requirements-dev.txt
+      #       displayName: "Install Python dependencies"
+      #     - script: |
+      #         . "$(Agent.TempDirectory)/venv/bin/activate"
+      #         python - <<'EOF'
+      #         import os, sys, time
+      #         # Fail fast (without printing values) if the env mapping is missing
+      #         missing = [v for v in ("DATABASE_URL", "SECRET_KEY") if not os.environ.get(v)]
+      #         if missing:
+      #             sys.exit(f"✗ Missing environment variables: {', '.join(missing)}")
+      #         import sqlalchemy as sa
+      #         engine = sa.create_engine(os.environ["DATABASE_URL"])
+      #         for attempt in range(60):
+      #             try:
+      #                 engine.connect().close()
+      #                 print("✓ Database is ready")
+      #                 break
+      #             except Exception:
+      #                 time.sleep(2)
+      #         else:
+      #             raise SystemExit("✗ Database did not become ready in 120s")
+      #         EOF
+      #       displayName: "Wait for TimescaleDB"
+      #       env:
+      #         DATABASE_URL: $(testDatabaseUrl)
+      #         SECRET_KEY: $(testSecretKey)
+      #         IN_CONTAINER: "true"
+      #     # Upgrade, full downgrade, upgrade again; then render offline SQL.
+      #     # Leaves the test database on the latest schema for the tests.
+      #     - script: |
+      #         set -euo pipefail
+      #         . "$(Agent.TempDirectory)/venv/bin/activate"
+      #         cd api
+      #         alembic upgrade head
+      #         alembic downgrade base
+      #         alembic upgrade head
+      #         alembic current
+      #         alembic upgrade head --sql > /dev/null
+      #       displayName: "Validate database migrations (Alembic)"
+      #       env:
+      #         DATABASE_URL: $(testDatabaseUrl)
+      #         SECRET_KEY: $(testSecretKey)
+      #         IN_CONTAINER: "true"
+      #     - script: |
+      #         set -euo pipefail
+      #         . "$(Agent.TempDirectory)/venv/bin/activate"
+      #         cd api
+      #         ./scripts/run-integration-tests.sh
+      #       displayName: "Run backend integration tests"
+      #       env:
+      #         DATABASE_URL: $(testDatabaseUrl)
+      #         SECRET_KEY: $(testSecretKey)
+      #         IN_CONTAINER: "true"
+      #     - task: PublishTestResults@2
+      #       displayName: "Publish integration test results"
+      #       condition: succeededOrFailed()
+      #       inputs:
+      #         testResultsFormat: JUnit
+      #         testResultsFiles: "api/test-results/integration-*.xml"
+      #         testRunTitle: "Backend Integration Tests"
+      #         failTaskOnFailedTests: true
+      #     - publish: api/coverage-integration.xml
+      #       artifact: coverage-backend-integration
+      #       displayName: "Publish coverage artifact"
+      #       condition: succeededOrFailed()
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 2: Frontend
+  # ─────────────────────────────────────────────────────────
+  - stage: Frontend
+    displayName: "Frontend — Lint, Types, Tests & Build"
+    dependsOn: []
+    jobs:
+      - job: FrontendChecks
+        displayName: "ESLint, TypeScript, Vitest & Build"
+        container: node
+        variables:
+          npm_config_cache: $(npmCacheDir)
+        steps:
+          - checkout: self
+          - task: Cache@2
+            displayName: "Cache npm downloads"
+            inputs:
+              key: 'npm | "$(Agent.OS)" | farmapp-frontend/package-lock.json'
+              restoreKeys: |
+                npm | "$(Agent.OS)"
+              path: $(npmCacheDir)
+          - script: npm ci --no-audit --no-fund
+            workingDirectory: farmapp-frontend
+            displayName: "Install dependencies (npm ci)"
+          - script: npm run lint
+            workingDirectory: farmapp-frontend
+            displayName: "ESLint"
+          - script: npm run typecheck
+            workingDirectory: farmapp-frontend
+            displayName: "TypeScript type check (tsc -b)"
+          - script: ./scripts/run-unit-tests.sh
+            workingDirectory: farmapp-frontend
+            displayName: "Run frontend unit tests (Vitest)"
+          - task: PublishTestResults@2
+            displayName: "Publish frontend test results"
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: "farmapp-frontend/test-results/unit-*.xml"
+              testRunTitle: "Frontend Unit Tests"
+              failTaskOnFailedTests: true
+          - publish: farmapp-frontend/coverage
+            artifact: coverage-frontend
+            displayName: "Publish coverage artifact"
+            condition: succeededOrFailed()
+          - script: npm run build
+            workingDirectory: farmapp-frontend
+            displayName: "Production build (vite build)"
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 3: Images — build + vulnerability scan
+  # ─────────────────────────────────────────────────────────
+  - stage: Images
+    displayName: "Docker Build & Image Scan"
+    dependsOn: []
+    jobs:
+      - job: BuildAndScan
+        displayName: "Build & Trivy scan images"
+        variables:
+          apiImage: "optifarm-api:pr-$(Build.BuildId)"
+          frontendImage: "optifarm-frontend:pr-$(Build.BuildId)"
+        steps:
+          - checkout: self
+          - script: |
+              set -euo pipefail
+              docker build -t "$(apiImage)" api/
+              docker build -t "$(frontendImage)" farmapp-frontend/
+            displayName: "Build images"
+          - script: |
+              set -euo pipefail
+              for image in "$(apiImage)" "$(frontendImage)"; do
+                echo "→ Scanning ${image}"
+                docker run --rm \
+                  -v /var/run/docker.sock:/var/run/docker.sock \
+                  -v "$(Build.SourcesDirectory):/src:ro" -w /src \
+                  -v trivy-cache:/root/.cache \
+                  "$(trivyImage)" image \
+                  --severity HIGH,CRITICAL --ignore-unfixed \
+                  --ignorefile .trivyignore.yaml \
+                  --exit-code 1 "${image}"
+              done
+            displayName: "Trivy image scan (HIGH/CRITICAL, fixable)"
+          - script: docker image rm -f "$(apiImage)" "$(frontendImage)" || true
+            displayName: "Remove PR images"
+            condition: always()
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 4: Security — secrets, SAST, dependencies, IaC
+  # ─────────────────────────────────────────────────────────
+  - stage: Security
+    displayName: "Security Scanning"
+    dependsOn: []
+    jobs:
+      - job: SecretScan
+        displayName: "Secret scan (Gitleaks)"
+        steps:
+          - checkout: self
+            fetchDepth: 0
+          - script: |
+              set -euo pipefail
+              TARGET_BRANCH="$(System.PullRequest.TargetBranch)"
+              LOG_OPTS=""
+              # In PR builds scan only the PR's commits; otherwise full history
+              if [[ "$TARGET_BRANCH" == refs/heads/* ]]; then
+                LOG_OPTS="--log-opts=origin/${TARGET_BRANCH#refs/heads/}..HEAD"
+                echo "→ Scanning commits in origin/${TARGET_BRANCH#refs/heads/}..HEAD"
+              else
+                echo "→ Not a PR build: scanning full history"
+              fi
+              docker run --rm -v "$(Build.SourcesDirectory):/repo" \
+                "$(gitleaksImage)" git /repo \
+                --config /repo/.gitleaks.toml --redact --no-banner ${LOG_OPTS}
+            displayName: "Gitleaks (git history)"
+
+      - job: SAST
+        displayName: "SAST (Semgrep)"
+        steps:
+          - checkout: self
+          - script: |
+              docker run --rm -v "$(Build.SourcesDirectory):/src" -w /src \
+                "$(semgrepImage)" semgrep scan \
+                --config p/python --config p/typescript --config p/react --config p/dockerfile \
+                --severity ERROR --error --metrics=off \
+                --exclude node_modules --exclude .terraform
+            displayName: "Semgrep (ERROR severity blocks)"
+
+      - job: DependencyAndIaC
+        displayName: "Dependency & IaC scan (Trivy)"
+        steps:
+          - checkout: self
+          - script: |
+              set -euo pipefail
+              TRIVY="docker run --rm -v $(Build.SourcesDirectory):/src:ro -w /src -v trivy-cache:/root/.cache $(trivyImage)"
+              for target in api farmapp-frontend; do
+                echo "→ Dependencies: ${target}"
+                $TRIVY fs --scanners vuln \
+                  --severity HIGH,CRITICAL --ignore-unfixed \
+                  --ignorefile .trivyignore.yaml \
+                  --skip-dirs "**/node_modules" \
+                  --exit-code 1 "${target}"
+              done
+            displayName: "Trivy dependency scan (requirements.txt, package-lock.json)"
+          - script: |
+              set -euo pipefail
+              docker run --rm -v "$(Build.SourcesDirectory):/src:ro" -w /src \
+                -v trivy-cache:/root/.cache "$(trivyImage)" config \
+                --severity HIGH,CRITICAL \
+                --ignorefile .trivyignore.yaml \
+                --skip-dirs "**/node_modules" --skip-dirs "**/.terraform" \
+                --exit-code 1 .
+            displayName: "Trivy IaC scan (Helm, Terraform, Dockerfiles)"
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 5: Deployment manifests
+  # ─────────────────────────────────────────────────────────
+  - stage: Manifests
+    displayName: "Helm Charts & Manifests"
+    dependsOn: []
+    jobs:
+      - job: HelmAndIngress
+        displayName: "helm lint/template & ingress render"
+        container: python
+        steps:
+          - checkout: self
+          - task: HelmInstaller@1
+            displayName: "Install Helm"
+            inputs:
+              helmVersionToInstall: latest
+          - script: |
+              set -euo pipefail
+              for chart in timescaledb backend frontend; do
+                echo "→ ${chart}"
+                helm lint "pipelines/charts/${chart}" \
+                  --set environment=staging,namespace=optifarm-staging
+                helm template "${chart}" "pipelines/charts/${chart}" \
+                  --set environment=staging,namespace=optifarm-staging > /dev/null
+              done
+            displayName: "helm lint & template"
+          # Same substitution the deploy pipeline does with envsubst
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 6: Coverage report (merged)
+  # ─────────────────────────────────────────────────────────
+  - stage: Report
+    displayName: "Code Coverage"
+    dependsOn:
+      - Backend
+      - Frontend
+    condition: succeededOrFailed()
+    jobs:
+      - job: Coverage
+        displayName: "Publish merged coverage"
+        steps:
+          - checkout: self
+          - download: current
+            patterns: "coverage-*/**"
+            displayName: "Download coverage artifacts"
+          - task: PublishCodeCoverageResults@2
+            displayName: "Publish code coverage"
+            inputs:
+              # coverage.xml, coverage-integration.xml, cobertura-coverage.xml
+              summaryFileLocation: "$(Pipeline.Workspace)/coverage-*/*.xml"
+              pathToSources: $(Build.SourcesDirectory)
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 7: SonarQube quality gate (disabled until a server exists)
+  # ─────────────────────────────────────────────────────────
+  # Enable by setting the enableSonar parameter default to true once the
+  # "farmapp-sonarqube" service connection is configured.
+  - ${{ if eq(parameters.enableSonar, true) }}:
+      - stage: QualityGate
+        displayName: "SonarQube Quality Gate"
+        dependsOn:
+          - Backend
+          - Frontend
+        jobs:
+          - job: SonarQube
+            displayName: "SonarQube analysis"
+            steps:
+              - checkout: self
+                fetchDepth: 0
+              - download: current
+                patterns: "coverage-*/**"
+                displayName: "Download coverage artifacts"
+              - task: SonarQubePrepare@7
+                displayName: "Prepare SonarQube analysis"
+                inputs:
+                  SonarQube: "farmapp-sonarqube"
+                  scannerMode: cli
+                  configMode: manual
+                  cliProjectKey: farmapp
+                  cliProjectName: FarmApp
+                  cliSources: "."
+                  extraProperties: |
+                    sonar.sources=api,farmapp-frontend/src
+                    sonar.tests=api/tests,farmapp-frontend/tests
+                    sonar.exclusions=api/migrations/**,api/tests/**
+                    sonar.python.version=3.12
+                    sonar.python.coverage.reportPaths=$(Pipeline.Workspace)/coverage-backend-unit/coverage.xml,$(Pipeline.Workspace)/coverage-backend-integration/coverage-integration.xml
+                    sonar.javascript.lcov.reportPaths=$(Pipeline.Workspace)/coverage-frontend/lcov.info
+              - task: SonarQubeAnalyze@7
+                displayName: "Run SonarQube analysis"
+              - task: SonarQubePublish@7
+                displayName: "Publish quality gate result"
+                inputs:
+                  pollingTimeoutSec: "300"

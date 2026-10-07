@@ -1,0 +1,61 @@
+# ─────────────────────────────────────────────
+# External Secrets Operator resources (rendered by install-k3s-stack.yml)
+#
+#   1. ClusterSecretStore — Azure Key Vault, workload UAMI via IMDS
+#   2. ClusterGenerator   — short-lived ACR tokens, workload UAMI via IMDS
+#   3. ExternalSecret     — "{{ acr_pull_secret_name }}" docker pull secret
+#                           in every application namespace
+# ─────────────────────────────────────────────
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: {{ cluster_secret_store_name }}
+spec:
+  provider:
+    azurekv:
+      authType: ManagedIdentity
+      identityId: "{{ eso_identity_client_id }}"
+      vaultUrl: "https://{{ key_vault_name }}.vault.azure.net"
+  conditions:
+    - namespaces:
+{% for ns in app_namespaces %}
+        - {{ ns }}
+{% endfor %}
+---
+apiVersion: generators.external-secrets.io/v1alpha1
+kind: ClusterGenerator
+metadata:
+  name: {{ acr_generator_name }}
+spec:
+  kind: ACRAccessToken
+  generator:
+    acrAccessTokenSpec:
+      registry: "{{ acr_login_server }}"
+      auth:
+        managedIdentity:
+          identityId: "{{ eso_identity_client_id }}"
+{% for ns in app_namespaces %}
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: {{ acr_pull_secret_name }}
+  namespace: {{ ns }}
+spec:
+  # ACR refresh tokens are valid for ~3h; renew well before expiry
+  refreshInterval: 1h
+  target:
+    name: {{ acr_pull_secret_name }}
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: |
+          {"auths":{"{{ acr_login_server }}":{"username":"{% raw %}{{ .username }}{% endraw %}","password":"{% raw %}{{ .password }}{% endraw %}","auth":"{% raw %}{{ printf "%s:%s" .username .password | b64enc }}{% endraw %}"}}}
+  dataFrom:
+    - sourceRef:
+        generatorRef:
+          apiVersion: generators.external-secrets.io/v1alpha1
+          kind: ClusterGenerator
+          name: {{ acr_generator_name }}
+{% endfor %}

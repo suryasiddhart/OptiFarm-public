@@ -1,0 +1,397 @@
+# ─────────────────────────────────────────────
+# install-k3s-stack.yml — Ansible Playbook
+#
+# Ansible playbook that installs:
+#   1. k3s (traefik disabled, TLS SANs for external access)
+#   2. Helm 3
+#   3. nginx ingress controller (hostNetwork, DaemonSet, ClusterIP)
+#   4. Application namespaces (optifarm-dev / -staging / -prod)
+#   5. External Secrets Operator + ClusterSecretStore for Azure Key Vault,
+#      ACR token ClusterGenerator and an "acr-pull-secret" per app namespace
+#      (all authenticate with the VM's user-assigned workload identity)
+#   6. cert-manager + Let's Encrypt ClusterIssuers ("letsencrypt" and
+#      "letsencrypt-test", HTTP-01 via nginx) for the ingress TLS certificates
+#
+# The playbook also fetches the kubeconfig from the VM to the Ansible
+# controller (build agent), replacing 127.0.0.1 with the VM's public IP
+# so it can be used by external clients.
+#
+# Variables (passed via --extra-vars):
+#   public_ip              — VM public IP address (required)
+#   key_vault_name         — Azure Key Vault name ESO syncs secrets from (required)
+#   eso_identity_client_id — client ID of the VM workload UAMI (required)
+#   acr_login_server       — ACR login server, e.g. acroptifarm.azurecr.io (required)
+#   acme_email             — Let's Encrypt account / expiry-notice email (optional)
+#
+# Usage:
+#   ansible-playbook -i <inventory> playbooks/install-k3s-stack.yml \
+#     --extra-vars "public_ip=<VM_PUBLIC_IP> key_vault_name=<KV_NAME> \
+#                   eso_identity_client_id=<UAMI_CLIENT_ID> acr_login_server=<ACR>"
+# ─────────────────────────────────────────────
+---
+- name: Install k3s, Helm, nginx ingress controller, External Secrets Operator and cert-manager
+  hosts: k3s_nodes
+  become: true
+  gather_facts: true
+
+  vars:
+    public_ip: "{{ public_ip | mandatory }}"
+    key_vault_name: "{{ key_vault_name | mandatory }}"
+    eso_identity_client_id: "{{ eso_identity_client_id | mandatory }}"
+    acr_login_server: "{{ acr_login_server | mandatory }}"
+    kubeconfig_remote_path: /etc/rancher/k3s/k3s.yaml
+    kubeconfig_local_dir: /tmp
+    kubeconfig_local_file: kubeconfig.yaml
+    k3s_install_retries: 30
+    k3s_install_delay: 5
+    app_namespaces:
+      - optifarm-dev
+      - optifarm-staging
+      - optifarm-prod
+    eso_namespace: external-secrets
+    eso_chart_version: 2.11.0
+    cluster_secret_store_name: azure-keyvault
+    acr_generator_name: acr-token
+    acr_pull_secret_name: acr-pull-secret
+    eso_resources_remote_path: /tmp/eso-resources.yaml
+    cert_manager_namespace: cert-manager
+    cert_manager_chart_version: v1.21.2
+    cluster_issuer_name: letsencrypt
+    cluster_issuers_remote_path: /tmp/cluster-issuers.yaml
+    # Overridable with --extra-vars "acme_email=..."
+    acme_email: suryasiddhart@gmail.com
+
+  tasks:
+    # ─────────────────────────────────────────────
+    # Step 1: Check if k3s is already installed and running
+    # ─────────────────────────────────────────────
+    - name: Check if k3s is installed and running
+      ansible.builtin.command: systemctl is-active --quiet k3s
+      register: k3s_service_status
+      changed_when: false
+      failed_when: false
+
+    # ─────────────────────────────────────────────
+    # Step 2: Install k3s (traefik disabled, TLS SANs configured)
+    # ─────────────────────────────────────────────
+    - name: Install k3s server (TLS SANs configured)
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server \
+          --disable=traefik \
+          --write-kubeconfig-mode=644 \
+          --tls-san={{ public_ip }} \
+          --node-external-ip={{ public_ip }}" sh -
+      args:
+        creates: /usr/local/bin/k3s
+      when: k3s_service_status.rc != 0
+      register: k3s_install_result
+
+    - name: Show k3s installation result
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'k3s installation complete' if k3s_install_result.changed
+             else 'k3s was already installed' }}
+      when: k3s_service_status.rc != 0
+
+    - name: Wait 5 seconds for k3s to start
+      ansible.builtin.pause:
+        seconds: 10
+      when: k3s_install_result.changed | default(false)
+
+    # ─────────────────────────────────────────────
+    # Step 3: Wait for k3s node to be Ready
+    # ─────────────────────────────────────────────
+    - name: Get k3s node name
+      ansible.builtin.command: k3s kubectl get nodes -o jsonpath='{.items[0].metadata.name}'
+      register: k3s_node_name
+      changed_when: false
+      retries: 5
+      delay: 3
+      until: k3s_node_name.stdout | length > 0
+
+    - name: Display k3s node name
+      ansible.builtin.debug:
+        msg: "k3s node name: {{ k3s_node_name.stdout }}"
+
+    - name: Wait for k3s node to be Ready
+      ansible.builtin.command: >-
+        k3s kubectl get nodes {{ k3s_node_name.stdout }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: k3s_node_ready
+      changed_when: false
+      retries: "{{ k3s_install_retries }}"
+      delay: "{{ k3s_install_delay }}"
+      until: k3s_node_ready.stdout == "True"
+
+    - name: Confirm k3s node is Ready
+      ansible.builtin.debug:
+        msg: "k3s node '{{ k3s_node_name.stdout }}' is Ready"
+
+    # ─────────────────────────────────────────────
+    # Step 4: Install Helm if missing
+    # ─────────────────────────────────────────────
+    - name: Check if Helm is installed
+      ansible.builtin.command: which helm
+      register: helm_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install Helm 3
+      ansible.builtin.shell: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+      when: helm_check.rc != 0
+      register: helm_install_result
+
+    - name: Show Helm installation result
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Helm installed' if helm_install_result.changed
+             else 'Helm already installed' }}
+      when: helm_check.rc != 0
+
+    # ─────────────────────────────────────────────
+    # Step 5: Install nginx ingress controller via Helm
+    # ─────────────────────────────────────────────
+    # Use hostNetwork for bare-metal (single VM, no cloud LoadBalancer).
+    # dnsPolicy=ClusterFirstWithHostNet is required when hostNetwork is enabled.
+    - name: Add ingress-nginx Helm repository
+      ansible.builtin.shell: helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+      environment:
+        KUBECONFIG: "{{ kubeconfig_remote_path }}"
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout"
+
+    - name: Add external-secrets Helm repository
+      ansible.builtin.shell: helm repo add external-secrets https://charts.external-secrets.io
+      environment:
+        KUBECONFIG: "{{ kubeconfig_remote_path }}"
+      register: helm_repo_add_eso
+      changed_when: "'has been added' in helm_repo_add_eso.stdout"
+
+    - name: Add jetstack (cert-manager) Helm repository
+      ansible.builtin.shell: helm repo add jetstack https://charts.jetstack.io
+      environment:
+        KUBECONFIG: "{{ kubeconfig_remote_path }}"
+      register: helm_repo_add_jetstack
+      changed_when: "'has been added' in helm_repo_add_jetstack.stdout"
+
+    - name: Update Helm repositories
+      ansible.builtin.shell: helm repo update
+      environment:
+        KUBECONFIG: "{{ kubeconfig_remote_path }}"
+      register: helm_repo_update
+      changed_when: "'Successfully got an update' in helm_repo_update.stdout"
+
+    - name: Install nginx ingress controller via Helm (idempotent)
+      ansible.builtin.shell: >-
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx
+        --namespace kube-system
+        --set controller.hostNetwork=true
+        --set controller.dnsPolicy=ClusterFirstWithHostNet
+        --set controller.kind=DaemonSet
+        --set controller.service.type=ClusterIP
+        --set-string controller.config.limit-req-status-code=429
+        --set-string controller.config.limit-conn-status-code=429
+        --wait --timeout 5m
+      environment:
+        KUBECONFIG: "{{ kubeconfig_remote_path }}"
+      register: helm_install_nginx
+      changed_when: "'deployed' in helm_install_nginx.stdout or 'upgraded' in helm_install_nginx.stdout"
+
+    - name: Show nginx ingress installation result
+      ansible.builtin.debug:
+        msg: "nginx ingress controller installed: {{ helm_install_nginx.stdout_lines[-1] | default(helm_install_nginx.stdout) }}"
+
+    # ─────────────────────────────────────────────
+    # Step 6: Create application namespaces
+    # ─────────────────────────────────────────────
+    - name: Create application namespaces (idempotent)
+      ansible.builtin.shell: >-
+        k3s kubectl create namespace {{ item }} --dry-run=client -o yaml
+        | k3s kubectl apply -f -
+      loop: "{{ app_namespaces }}"
+      register: namespace_apply
+      changed_when: "'created' in namespace_apply.stdout"
+
+    # ─────────────────────────────────────────────
+    # Step 7: Install External Secrets Operator via Helm
+    # ─────────────────────────────────────────────
+    - name: Install External Secrets Operator via Helm (idempotent)
+      ansible.builtin.shell: >-
+        helm upgrade --install external-secrets external-secrets/external-secrets
+        --namespace {{ eso_namespace }}
+        --create-namespace
+        --version {{ eso_chart_version }}
+        --set installCRDs=true
+        --wait --timeout 5m
+      environment:
+        KUBECONFIG: "{{ kubeconfig_remote_path }}"
+      register: helm_install_eso
+      changed_when: "'deployed' in helm_install_eso.stdout or 'upgraded' in helm_install_eso.stdout"
+
+    - name: Show External Secrets Operator installation result
+      ansible.builtin.debug:
+        msg: "External Secrets Operator installed: {{ helm_install_eso.stdout_lines[-1] | default(helm_install_eso.stdout) }}"
+
+    # ─────────────────────────────────────────────
+    # Step 8: ClusterSecretStore, ACR token generator and pull secrets
+    # ─────────────────────────────────────────────
+    # ManagedIdentity auth uses the VM's user-assigned workload identity via
+    # IMDS. Terraform grants it "Key Vault Secrets User" on the vault and
+    # "AcrPull" on the registry. Resources: templates/eso-resources.yaml.j2
+    # Retries cover the ESO webhook becoming ready after the Helm install.
+    - name: Render External Secrets resources
+      ansible.builtin.template:
+        src: templates/eso-resources.yaml.j2
+        dest: "{{ eso_resources_remote_path }}"
+        mode: "0600"
+
+    - name: Apply External Secrets resources
+      ansible.builtin.command: k3s kubectl apply -f {{ eso_resources_remote_path }}
+      register: eso_apply
+      changed_when: "'created' in eso_apply.stdout or 'configured' in eso_apply.stdout"
+      retries: 10
+      delay: 10
+      until: eso_apply.rc == 0
+
+    # Retries also cover Azure RBAC propagation of the new role assignments
+    - name: Wait for ClusterSecretStore to be Ready
+      ansible.builtin.command: >-
+        k3s kubectl get clustersecretstore {{ cluster_secret_store_name }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: css_ready
+      changed_when: false
+      retries: "{{ k3s_install_retries }}"
+      delay: 10
+      until: css_ready.stdout == "True"
+
+    - name: Confirm ClusterSecretStore is Ready
+      ansible.builtin.debug:
+        msg: "ClusterSecretStore '{{ cluster_secret_store_name }}' is Ready (vault: {{ key_vault_name }})"
+
+    - name: Wait for ACR pull secret to sync in each application namespace
+      ansible.builtin.command: >-
+        k3s kubectl get externalsecret {{ acr_pull_secret_name }} -n {{ item }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      loop: "{{ app_namespaces }}"
+      register: acr_secret_ready
+      changed_when: false
+      retries: "{{ k3s_install_retries }}"
+      delay: 10
+      until: acr_secret_ready.stdout == "True"
+
+    - name: Remove rendered External Secrets resources
+      ansible.builtin.file:
+        path: "{{ eso_resources_remote_path }}"
+        state: absent
+
+    # ─────────────────────────────────────────────
+    # Step 9: cert-manager + Let's Encrypt ClusterIssuers
+    # ─────────────────────────────────────────────
+    # Ingresses request certificates with the annotation
+    # cert-manager.io/cluster-issuer: letsencrypt (see pipelines/manifests/ingress.yml).
+    - name: Install cert-manager via Helm (idempotent)
+      ansible.builtin.shell: >-
+        helm upgrade --install cert-manager jetstack/cert-manager
+        --namespace {{ cert_manager_namespace }}
+        --create-namespace
+        --version {{ cert_manager_chart_version }}
+        --set crds.enabled=true
+        --wait --timeout 5m
+      environment:
+        KUBECONFIG: "{{ kubeconfig_remote_path }}"
+      register: helm_install_cert_manager
+      changed_when: "'deployed' in helm_install_cert_manager.stdout or 'upgraded' in helm_install_cert_manager.stdout"
+
+    - name: Render Let's Encrypt ClusterIssuers
+      ansible.builtin.template:
+        src: templates/cluster-issuers.yaml.j2
+        dest: "{{ cluster_issuers_remote_path }}"
+        mode: "0600"
+
+    # Retries cover the cert-manager webhook becoming ready after the Helm install
+    - name: Apply Let's Encrypt ClusterIssuers
+      ansible.builtin.command: k3s kubectl apply -f {{ cluster_issuers_remote_path }}
+      register: issuers_apply
+      changed_when: "'created' in issuers_apply.stdout or 'configured' in issuers_apply.stdout"
+      retries: 10
+      delay: 10
+      until: issuers_apply.rc == 0
+
+    - name: Wait for ClusterIssuers to be Ready (ACME account registered)
+      ansible.builtin.command: >-
+        k3s kubectl get clusterissuer {{ item }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      loop:
+        - "{{ cluster_issuer_name }}"
+        - "{{ cluster_issuer_name }}-test"
+      register: issuer_ready
+      changed_when: false
+      retries: "{{ k3s_install_retries }}"
+      delay: 10
+      until: issuer_ready.stdout == "True"
+
+    - name: Remove rendered ClusterIssuers
+      ansible.builtin.file:
+        path: "{{ cluster_issuers_remote_path }}"
+        state: absent
+
+    # ─────────────────────────────────────────────
+    # Step 10: Fetch kubeconfig to Ansible controller
+    # ─────────────────────────────────────────────
+    # Fetch the kubeconfig from the VM, then replace 127.0.0.1 with
+    # the VM's public IP so it can be used from external clients.
+    - name: Fetch kubeconfig from VM
+      ansible.builtin.fetch:
+        src: "{{ kubeconfig_remote_path }}"
+        dest: "{{ kubeconfig_local_dir }}/{{ kubeconfig_local_file }}"
+        flat: true
+
+    - name: Replace 127.0.0.1 with public IP in kubeconfig
+      ansible.builtin.replace:
+        path: "{{ kubeconfig_local_dir }}/{{ kubeconfig_local_file }}"
+        regexp: 'https://127\.0\.0\.1:6443'
+        replace: "https://{{ public_ip }}:6443"
+      delegate_to: localhost
+      become: false
+
+    - name: Confirm kubeconfig fetched
+      ansible.builtin.debug:
+        msg: >-
+          Kubeconfig fetched to {{ kubeconfig_local_dir }}/{{ kubeconfig_local_file }}
+          (server URL updated to https://{{ public_ip }}:6443)
+
+    # ─────────────────────────────────────────────
+    # Step 11: Verify nginx ingress controller, ESO and cert-manager pods
+    # ─────────────────────────────────────────────
+    - name: Verify nginx ingress controller pods
+      ansible.builtin.command: k3s kubectl get pods -n kube-system -l app.kubernetes.io/name=ingress-nginx -o wide
+      register: nginx_pods
+      changed_when: false
+
+    - name: Show nginx ingress controller pods
+      ansible.builtin.debug:
+        var: nginx_pods.stdout_lines
+
+    - name: Verify External Secrets Operator pods
+      ansible.builtin.command: k3s kubectl get pods -n {{ eso_namespace }} -o wide
+      register: eso_pods
+      changed_when: false
+
+    - name: Show External Secrets Operator pods
+      ansible.builtin.debug:
+        var: eso_pods.stdout_lines
+
+    - name: Verify cert-manager pods
+      ansible.builtin.command: k3s kubectl get pods -n {{ cert_manager_namespace }} -o wide
+      register: cert_manager_pods
+      changed_when: false
+
+    - name: Show cert-manager pods
+      ansible.builtin.debug:
+        var: cert_manager_pods.stdout_lines
+
+    - name: k3s + Helm + nginx ingress + ESO + cert-manager installation complete
+      ansible.builtin.debug:
+        msg: "k3s + Helm + nginx ingress + External Secrets Operator + cert-manager installation complete"

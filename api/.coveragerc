@@ -1,0 +1,11 @@
+# Coverage settings for pytest-cov (see scripts/run-*-tests.sh)
+[run]
+source = .
+omit =
+    tests/*
+    migrations/*
+    venv/*
+    .venv/*
+
+[report]
+skip_empty = true

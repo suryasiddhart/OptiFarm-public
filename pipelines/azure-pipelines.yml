@@ -1,0 +1,147 @@
+# FarmApp — Main CI/CD Pipeline
+# Triggered ONLY on merge to develop/main or tag push.
+# PR validation is handled by a SEPARATE pipeline (pr-validation.yml)
+# configured as a Build Validation policy in Azure Repos branch settings.
+#
+# This pipeline assumes tests & scans already passed via PR validation.
+# It focuses on: Build Docker images → Push to ACR → Helm deploy to k3s.
+#
+# Deploy stages use templates/deploy-k3s.yml. Required in variable group
+# `optifarm-variables`:
+#   - key_vault_name — Key Vault holding kubeconfig-<env> (e.g. optifarm-kv1)
+# Service connection `terraform-arm-connection` must be able to read
+# Key Vault secrets. App secrets are synced in-cluster by ESO.
+
+trigger:
+  branches:
+    include:
+      - develop
+      - main
+  tags:
+    include:
+      - v*
+  paths:
+    include:
+      - api/*
+      - farmapp-frontend/*
+      - pipelines/*
+      - db/*
+
+pr: none
+
+variables:
+  - group: optifarm-variables  # Azure Library variable group
+  - name: dockerRegistryServiceConnection
+    value: "optifarm-acr-connection"
+  - name: imageRepositoryBackend
+    value: "api"
+  - name: imageRepositoryFrontend
+    value: "frontend"
+  - name: containerRegistry
+    value: "acroptifarm.azurecr.io"
+  - name: dockerfilePathBackend
+    value: "$(Build.SourcesDirectory)/api/Dockerfile"
+  - name: dockerfilePathFrontend
+    value: "$(Build.SourcesDirectory)/farmapp-frontend/Dockerfile"
+  - name: tag
+    value: $(Build.BuildId)
+
+
+stages:
+  # ─────────────────────────────────────────────────────────
+  # STAGE 1: Build & Push Docker Images
+  # ─────────────────────────────────────────────────────────
+  - stage: Build
+    displayName: "Build & Push Docker Images"
+    jobs:
+      - job: BuildBackend
+        displayName: "Build Backend API Image"
+        pool:
+          name: Exp-Agent
+        steps:
+          - checkout: self
+   
+          - task: Docker@2
+            displayName: "Login to ACR"
+            inputs:
+              command: login
+              containerRegistry: $(dockerRegistryServiceConnection)
+
+          - task: Docker@2
+            displayName: "Build & Push Backend"
+            inputs:
+              command: buildAndPush
+              repository: $(imageRepositoryBackend)
+              dockerfile: $(dockerfilePathBackend)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+
+          # - publish: $(Build.ArtifactStagingDirectory)
+          #   artifact: manifests
+          #   displayName: "Publish Kubernetes manifests"
+
+      - job: BuildFrontend
+        displayName: "Build and push Frontend Image"
+        pool:
+          name: Exp-Agent
+        steps:
+          - checkout: self
+
+          - task: Docker@2
+            displayName: "Login to ACR"
+            inputs:
+              command: login
+              containerRegistry: $(dockerRegistryServiceConnection)
+
+          - task: Docker@2
+            displayName: "Build & Push Frontend"
+            inputs:
+              command: buildAndPush
+              repository: $(imageRepositoryFrontend)
+              dockerfile: $(dockerfilePathFrontend)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 2: Deploy to k3s (dev → staging → prod)
+  # ─────────────────────────────────────────────────────────
+  - template: templates/deploy-k3s.yml
+    parameters:
+      stageName: DeployDev
+      displayName: "Deploy to Development"
+      envName: dev
+      environment: "dev"
+      # condition: |
+      #   and(
+      #     succeeded(),
+      #     eq(variables['Build.SourceBranch'], 'refs/heads/develop')
+      #   )
+
+  - template: templates/deploy-k3s.yml
+    parameters:
+      stageName: DeployStaging
+      displayName: "Deploy to Staging"
+      envName: staging
+      environment: "staging"
+      ingressHostPrefix: "staging."
+      condition: |
+        and(
+          succeeded(),
+          eq(variables['Build.SourceBranch'], 'refs/heads/main')
+        )
+
+  - template: templates/deploy-k3s.yml
+    parameters:
+      stageName: DeployProd
+      displayName: "Deploy to Production"
+      envName: prod
+      environment: "prod"
+      ingressHostPrefix: "prod."
+      condition: |
+        and(
+          succeeded(),
+          startsWith(variables['Build.SourceBranch'], 'refs/tags/v')
+        )

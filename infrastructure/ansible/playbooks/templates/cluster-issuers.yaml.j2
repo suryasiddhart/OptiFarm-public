@@ -1,0 +1,31 @@
+# ─────────────────────────────────────────────
+# cert-manager ClusterIssuers (rendered by install-k3s-stack.yml)
+#
+# Names refer to Let's Encrypt's servers, NOT to app environments:
+#   {{ cluster_issuer_name }}       — real CA, browser-trusted certs.
+#                           Used by every app environment (dev/staging/prod).
+#   {{ cluster_issuer_name }}-test  — Let's Encrypt test CA (untrusted certs,
+#                           very high rate limits); only for trying the flow.
+#
+# Both solve the HTTP-01 challenge through the nginx ingress controller.
+# ─────────────────────────────────────────────
+{% for issuer in [
+     {'name': cluster_issuer_name, 'server': 'https://acme-v02.api.letsencrypt.org/directory'},
+     {'name': cluster_issuer_name ~ '-test', 'server': 'https://acme-staging-v02.api.letsencrypt.org/directory'}
+   ] %}
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ issuer.name }}
+spec:
+  acme:
+    email: {{ acme_email }}
+    server: {{ issuer.server }}
+    privateKeySecretRef:
+      name: {{ issuer.name }}-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+{% endfor %}

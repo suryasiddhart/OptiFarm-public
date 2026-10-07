@@ -1,0 +1,188 @@
+# FarmApp — Deploy to k3s (stage template)
+#
+# Deploys the TimescaleDB, backend and frontend Helm charts plus the shared
+# ingress into the optifarm-<envName> namespace of the k3s cluster.
+#
+# Prerequisites (created by the infrastructure pipeline):
+#   - Key Vault secret "kubeconfig-<envName>" (kubeconfig for the k3s VM)
+#   - Namespace optifarm-<envName>, External Secrets Operator, the
+#     "azure-keyvault" ClusterSecretStore and the "acr-pull-secret" ExternalSecret
+#   - Key Vault secrets postgres-user/-password-<envName>, jwt-secret-key-<envName>
+#
+# Pipeline variables used: key_vault_name, containerRegistry,
+#   imageRepositoryBackend, imageRepositoryFrontend, tag
+
+parameters:
+  - name: stageName
+    type: string
+  - name: displayName
+    type: string
+  - name: envName            # dev | staging | prod
+    type: string
+  - name: environment        # Azure DevOps environment (approvals)
+    type: string
+  - name: condition
+    type: string
+    default: succeeded()
+  # Ingress host is "<prefix><vm-public-ip>.<ingressDomain>"; all namespaces
+  # share one VM/ingress controller, so each environment needs a distinct prefix.
+  - name: ingressHostPrefix
+    type: string
+    default: ""
+  # Wildcard-DNS service resolving <ip>.<domain> to <ip>. sslip.io and nip.io
+  # are the same service with separate Let's Encrypt rate-limit pools — switch
+  # to "nip.io" if certificate issuance is ever rate-limited.
+  - name: ingressDomain
+    type: string
+    default: "sslip.io"
+  # cert-manager ClusterIssuer: "letsencrypt" (trusted certs, all app
+  # environments) or "letsencrypt-test" (Let's Encrypt test CA, untrusted;
+  # only for trying out the issuance flow without using real rate limits).
+  - name: clusterIssuer
+    type: string
+    default: "letsencrypt"
+    values:
+      - letsencrypt
+      - letsencrypt-test
+  - name: armServiceConnection
+    type: string
+    default: "terraform-arm-connection"
+
+stages:
+  - stage: ${{ parameters.stageName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: Build
+    condition: ${{ parameters.condition }}
+    jobs:
+      - deployment: DeployToK3s
+        displayName: "Deploy to k3s (optifarm-${{ parameters.envName }})"
+        pool:
+          name: Exp-Agent
+        environment: ${{ parameters.environment }}
+        variables:
+          namespace: "optifarm-${{ parameters.envName }}"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: KubectlInstaller@0
+                  inputs:
+                    kubectlVersion: 'latest'
+
+                - task: HelmInstaller@1
+                  inputs:
+                    helmVersionToInstall: 'latest'
+
+                - task: AzureCLI@2
+                  displayName: "Helm deploy to optifarm-${{ parameters.envName }}"
+                  inputs:
+                    azureSubscription: ${{ parameters.armServiceConnection }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      CHARTS="$(Build.SourcesDirectory)/pipelines/charts"
+                      export KUBECONFIG="$(Agent.TempDirectory)/kubeconfig"
+                      trap 'rm -f "$KUBECONFIG"' EXIT
+
+                      # ── Kubeconfig from Key Vault (stored by the infra pipeline) ──
+                      az keyvault secret show \
+                        --vault-name "$(key_vault_name)" \
+                        --name "kubeconfig-${{ parameters.envName }}" \
+                        --query value -o tsv > "$KUBECONFIG"
+                      chmod 600 "$KUBECONFIG"
+                      kubectl get nodes -o wide
+
+                      # ── TimescaleDB (credentials synced from Key Vault by ESO) ──
+                      helm upgrade --install timescaledb "$CHARTS/timescaledb" \
+                        --namespace "$(namespace)" \
+                        --set namespace="$(namespace)" \
+                        --set environment="${{ parameters.envName }}" \
+                        --wait --timeout 5m
+
+                      # ── Backend (DATABASE_URL / SECRET_KEY synced by ESO) ──
+                      # The "migrate" initContainer applies DB migrations first;
+                      # a failed migration fails --wait and the old pods keep serving.
+                      helm upgrade --install backend "$CHARTS/backend" \
+                        --namespace "$(namespace)" \
+                        --set namespace="$(namespace)" \
+                        --set environment="${{ parameters.envName }}" \
+                        --set image.repository="$(containerRegistry)/$(imageRepositoryBackend)" \
+                        --set image.tag="$(tag)" \
+                        --wait --timeout 5m
+
+                      # Schema migrations ran in the "migrate" initContainer (alembic upgrade head)
+                      echo "→ Database migration log:"
+                      kubectl logs deploy/api -c migrate -n "$(namespace)" --tail=50 || true
+
+                      echo "→ Waiting for ExternalSecrets to sync…"
+                      kubectl wait externalsecret --all -n "$(namespace)" \
+                        --for=condition=Ready --timeout=180s
+                      kubectl get externalsecret -n "$(namespace)"
+
+                      # ── Frontend ──
+                      helm upgrade --install frontend "$CHARTS/frontend" \
+                        --namespace "$(namespace)" \
+                        --set namespace="$(namespace)" \
+                        --set image.repository="$(containerRegistry)/$(imageRepositoryFrontend)" \
+                        --set image.tag="$(tag)" \
+                        --wait --timeout 5m
+
+                      # ── Shared HTTPS ingress (host derived from the k3s API server IP) ──
+                      VM_IP=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' \
+                        | sed -E 's#^https?://([^:/]+).*#\1#')
+                      export INGRESS_HOST="${{ parameters.ingressHostPrefix }}${VM_IP}.${{ parameters.ingressDomain }}"
+                      export CLUSTER_ISSUER="${{ parameters.clusterIssuer }}"
+                      echo "→ Ingress host: ${INGRESS_HOST} (issuer: ${CLUSTER_ISSUER})"
+                      envsubst '${INGRESS_HOST} ${CLUSTER_ISSUER}' < "$(Build.SourcesDirectory)/pipelines/manifests/ingress.yml" \
+                        | kubectl apply -n "$(namespace)" -f -
+
+                      # cert-manager creates Certificate/optifarm-tls from the ingress
+                      # annotation and solves the HTTP-01 challenge (first issue ~1 min).
+                      echo "→ Waiting for TLS certificate…"
+                      for i in $(seq 1 12); do
+                        kubectl get certificate optifarm-tls -n "$(namespace)" >/dev/null 2>&1 && break
+                        sleep 5
+                      done
+                      if ! kubectl wait certificate/optifarm-tls -n "$(namespace)" \
+                          --for=condition=Ready --timeout=300s; then
+                        echo "✗ Certificate not issued — cert-manager state:"
+                        kubectl describe certificate,certificaterequest,order,challenge -n "$(namespace)" || true
+                        exit 1
+                      fi
+                      kubectl get certificate optifarm-tls -n "$(namespace)"
+
+                      # ── Smoke test ──
+                      kubectl rollout status deploy/api -n "$(namespace)" --timeout=120s
+                      kubectl rollout status deploy/frontend -n "$(namespace)" --timeout=120s
+                      # The test CA is not browser-trusted, so skip verification only for it
+                      CURL_TLS_OPTS=""
+                      [ "${CLUSTER_ISSUER}" = "letsencrypt-test" ] && CURL_TLS_OPTS="-k"
+                      curl -fsS ${CURL_TLS_OPTS} --retry 5 --retry-delay 5 "https://${INGRESS_HOST}/api/health"
+                      echo
+                      HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://${INGRESS_HOST}/")
+                      if [ "$HTTP_CODE" != "308" ]; then
+                        echo "✗ Expected HTTP→HTTPS redirect (308), got ${HTTP_CODE}"
+                        exit 1
+                      fi
+                      echo "✓ HTTP redirects to HTTPS"
+
+                      # Auth endpoints are rate limited per client IP (farmapp-auth-ingress).
+                      # Random numbers per request so the API's per-account lockout
+                      # doesn't produce the 429s — only nginx can.
+                      LIMITED=0
+                      for i in $(seq 1 40); do
+                        CODE=$(curl -s ${CURL_TLS_OPTS} -o /dev/null -w '%{http_code}' \
+                          -H 'Content-Type: application/json' \
+                          -d "{\"mobileno\":\"smoke-${RANDOM}${i}\",\"password\":\"x\"}" \
+                          "https://${INGRESS_HOST}/api/auth/login")
+                        [ "$CODE" = "429" ] && LIMITED=$((LIMITED + 1))
+                      done
+                      if [ "$LIMITED" -eq 0 ]; then
+                        echo "✗ Expected rate limiting (429) on /api/auth/login, got none"
+                        exit 1
+                      fi
+                      echo "✓ Auth endpoints rate limited (${LIMITED}/40 requests got 429)"
+                      echo "✓ Deployed to $(namespace) — https://${INGRESS_HOST}"

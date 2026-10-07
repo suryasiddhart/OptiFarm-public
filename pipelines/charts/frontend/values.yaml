@@ -1,0 +1,56 @@
+# -- Namespace to deploy the frontend into
+namespace: optifarm-dev
+
+# -- Number of replicas for the frontend deployment
+replicaCount: 1
+
+image:
+  # -- Frontend image repository
+  repository: acroptifarm.azurecr.io/frontend
+  # -- Frontend image tag
+  tag: latest
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+
+# -- Pull secrets for ACR. "acr-pull-secret" is synced into every optifarm-*
+# namespace by ESO (ACR token generator, created by the infrastructure pipeline)
+imagePullSecrets:
+  - name: acr-pull-secret
+
+# -- Backend API base URL used by the browser (written to /config.js at
+# container start). "/api" = same host, routed to the backend by the ingress.
+apiBaseUrl: "/api"
+
+service:
+  # -- Frontend service port
+  port: 80
+  # -- Frontend service type
+  type: ClusterIP
+
+resources:
+  requests:
+    # -- CPU request
+    cpu: "100m"
+    # -- Memory request
+    memory: "128Mi"
+  limits:
+    # -- CPU limit
+    cpu: "250m"
+    # -- Memory limit
+    memory: "256Mi"
+
+probes:
+  liveness:
+    # -- Path for the liveness probe
+    path: /
+    # -- Initial delay for the liveness probe (seconds)
+    initialDelaySeconds: 10
+    # -- Period for the liveness probe (seconds)
+    periodSeconds: 30
+  readiness:
+    # -- Path for the readiness probe
+    path: /
+    # -- Initial delay for the readiness probe (seconds)
+    initialDelaySeconds: 5
+    # -- Period for the readiness probe (seconds)
+    periodSeconds: 15

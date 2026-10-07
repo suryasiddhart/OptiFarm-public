@@ -1,0 +1,88 @@
+# Shared ingress for the FarmApp frontend and backend API (HTTPS).
+#
+# Applied by the app pipeline (pipelines/templates/deploy-k3s.yml) after the
+# Helm releases are deployed:
+#   envsubst '${INGRESS_HOST} ${CLUSTER_ISSUER}' < pipelines/manifests/ingress.yml \
+#     | kubectl apply -n optifarm-<env> -f -
+# The namespace is set by `kubectl apply -n`. Variables (per environment):
+#   ${INGRESS_HOST}   — e.g. <vm-ip>.sslip.io, staging.<vm-ip>.sslip.io
+#   ${CLUSTER_ISSUER} — "letsencrypt" (trusted) or "letsencrypt-test"
+#
+# TLS: cert-manager (installed by the infrastructure pipeline) sees the
+# cluster-issuer annotation, creates Certificate/optifarm-tls, solves the
+# Let's Encrypt HTTP-01 challenge through nginx on port 80 and stores the
+# certificate in Secret/optifarm-tls. It renews automatically ~30 days before
+# expiry. Plain HTTP is redirected to HTTPS (308); ingress-nginx exempts the
+# /.well-known/acme-challenge path from the redirect.
+#
+# Rate limiting: nginx limit annotations apply to a whole Ingress, so the
+# login/register endpoints get their own Ingress (second document) with a
+# strict per-client-IP limit; the rest of the API is not throttled. Excess
+# requests get 429 (status set on the controller by the infrastructure
+# pipeline). Per-account lockout is enforced by the API itself.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: farmapp-ingress
+  annotations:
+    cert-manager.io/cluster-issuer: ${CLUSTER_ISSUER}
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/use-regex: "true"          # <-- enable regex
+    nginx.ingress.kubernetes.io/rewrite-target: /$1        # <-- use captured group
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ${INGRESS_HOST}
+      secretName: optifarm-tls
+  rules:
+  -  host: ${INGRESS_HOST}
+     http:
+        paths:
+          - path: /api/(.*)           # capture everything after /api/
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+          - path: /(.*)               # anything else (frontend)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+---
+# Brute-force protection for authentication endpoints (per client IP).
+# The longer regex path takes precedence over /api/(.*) in the main ingress.
+# TLS: reuses Secret/optifarm-tls issued for the main ingress (no
+# cert-manager annotation here, so no second Certificate is created).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: farmapp-auth-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$1
+    nginx.ingress.kubernetes.io/limit-rpm: "10"               # 10 requests/minute per IP
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"   # short bursts up to 20
+    nginx.ingress.kubernetes.io/limit-connections: "5"        # concurrent connections per IP
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ${INGRESS_HOST}
+      secretName: optifarm-tls
+  rules:
+  -  host: ${INGRESS_HOST}
+     http:
+        paths:
+          - path: /api/(auth/(login|register))   # $1 = auth/login or auth/register
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000

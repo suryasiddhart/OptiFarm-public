@@ -1,0 +1,105 @@
+# -- Namespace to deploy the backend into
+namespace: optifarm-dev
+
+# -- Environment name; selects the Key Vault secrets (e.g. jwt-secret-key-dev)
+environment: dev
+
+# -- Number of replicas for the backend deployment
+replicaCount: 1
+
+image:
+  # -- Backend image repository
+  repository: acroptifarm.azurecr.io/api
+  # -- Backend image tag
+  tag: latest
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+
+# -- Pull secrets for ACR. "acr-pull-secret" is synced into every optifarm-*
+# namespace by ESO (ACR token generator, created by the infrastructure pipeline)
+imagePullSecrets:
+  - name: acr-pull-secret
+
+service:
+  # -- Backend service port
+  port: 8000
+  # -- Backend service type
+  type: ClusterIP
+
+resources:
+  requests:
+    # -- CPU request
+    cpu: "250m"
+    # -- Memory request
+    memory: "256Mi"
+  limits:
+    # -- CPU limit
+    cpu: "500m"
+    # -- Memory limit
+    memory: "512Mi"
+
+probes:
+  liveness:
+    # -- Path for the liveness probe
+    path: /health
+    # -- Initial delay for the liveness probe (seconds)
+    initialDelaySeconds: 10
+    # -- Period for the liveness probe (seconds)
+    periodSeconds: 30
+  readiness:
+    # -- Path for the readiness probe
+    path: /health
+    # -- Initial delay for the readiness probe (seconds)
+    initialDelaySeconds: 5
+    # -- Period for the readiness probe (seconds)
+    periodSeconds: 15
+
+# -- Database connection details used to build DATABASE_URL
+# (credentials come from Key Vault, not from here)
+database:
+  # -- Defaults to timescaledb.<namespace>.svc.cluster.local when empty
+  host: ""
+  port: 5432
+  name: farmappdb
+
+# -- Database migrations: an initContainer runs `alembic upgrade head`
+# (migrations ship in the API image under api/migrations) before the API starts.
+migrations:
+  enabled: true
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "128Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+
+externalSecret:
+  # -- Create the ExternalSecret that syncs "optifarm-secrets" from Key Vault.
+  # When disabled, create the "optifarm-secrets" Secret manually.
+  enabled: true
+  # -- ClusterSecretStore created by the infrastructure pipeline (Ansible)
+  secretStore: azure-keyvault
+  # -- How often ESO re-reads Key Vault
+  refreshInterval: 1h
+
+# -- Environment variables for the backend container
+# These can be plain values or secretKeyRef references.
+# "optifarm-secrets" is created by templates/externalsecret.yaml.
+env:
+  - name: DATABASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: optifarm-secrets
+        key: database-url
+  - name: SECRET_KEY
+    valueFrom:
+      secretKeyRef:
+        name: optifarm-secrets
+        key: secret-key
+  - name: APP_NAME
+    value: "optifarm-api"
+  - name: APP_VERSION
+    value: "v1.0.0"
+  - name: DEBUG
+    value: "false"
