@@ -1,0 +1,60 @@
+# MQTT → Kafka. Exactly one replica: the bridge holds a persistent MQTT session
+# under a fixed client ID, so a second copy would disconnect the first.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mqtt-bridge
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "ingest.labels" . | nindent 4 }}
+    component: mqtt-bridge
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ingest
+      component: mqtt-bridge
+  template:
+    metadata:
+      labels:
+        app: ingest
+        component: mqtt-bridge
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: bridge
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "bridge.py"]
+          env:
+            - name: MQTT_HOST
+              value: {{ .Values.mqtt.host | quote }}
+            - name: MQTT_PORT
+              value: {{ .Values.mqtt.port | quote }}
+            - name: MQTT_BRIDGE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.bridgePassword.name }}
+                  key: {{ .Values.secrets.bridgePassword.key }}
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: {{ .Values.kafka.bootstrapServers | quote }}
+            - name: KAFKA_TELEMETRY_TOPIC
+              value: {{ .Values.kafka.telemetryTopic | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.bridge.resources | nindent 12 }}

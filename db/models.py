@@ -11,6 +11,7 @@ from sqlalchemy import (
     Float,
     String,
     Boolean,
+    CheckConstraint,
     Text,
     ForeignKey,
     Index,
@@ -19,7 +20,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import TIMESTAMP
+from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 
 from db.base import Base
 
@@ -80,33 +81,46 @@ class FieldDetail(Base):
         return f"<FieldDetail(fieldid={self.fieldid}, croptype={self.croptype})>"
 
 
-class MoistureData(Base):
-    """appschema.moisturedata — moisture readings from devices."""
+class Device(Base):
+    """appschema.devices — field devices, each owned by a user.
 
-    __tablename__ = "moisturedata"
-    __table_args__ = {"schema": "appschema"}
+    passkey_* hold the PBKDF2-SHA512 hash of the device's MQTT passkey; the
+    plaintext passkey is only ever returned once by the API.
+    """
 
-    # This table has no single-column PK in the DDL.
-    # We use a synthetic auto-increment id for ORM convenience,
-    # but the real-world key is (rtctime, deviceid, userinfo) or similar.
-    # Alembic will still generate the DDL faithfully.
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    moisture = Column(Float, nullable=True)
-    rtctime = Column(TIMESTAMP(timezone=True), nullable=False)
-    deviceid = Column(String, nullable=False)
+    __tablename__ = "devices"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'disabled')", name="devices_status_check"),
+        Index("idx_devices_userinfo", "userinfo"),
+        {"schema": "appschema"},
+    )
+
+    deviceid = Column(String(64), primary_key=True)
+    # Display name shown in the UI; deviceid is the generated MQTT username
+    devicename = Column(String(100), nullable=False)
     userinfo = Column(
         Integer,
-        ForeignKey("appschema.userdetails.userid"),
+        ForeignKey("appschema.userdetails.userid", ondelete="CASCADE"),
         nullable=False,
     )
     fieldid = Column(
         Integer,
-        ForeignKey("appschema.fielddetails.fieldid"),
+        ForeignKey("appschema.fielddetails.fieldid", ondelete="SET NULL"),
         nullable=True,
+    )
+    passkey_hash = Column(String, nullable=False)
+    passkey_salt = Column(String, nullable=False)
+    passkey_iterations = Column(Integer, nullable=False)
+    status = Column(String(16), nullable=False, server_default=text("'active'"))
+    last_seen = Column(TIMESTAMP(timezone=True), nullable=True)
+    created_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
     )
 
     def __repr__(self):
-        return f"<MoistureData(rtctime={self.rtctime}, deviceid={self.deviceid})>"
+        return f"<Device(deviceid={self.deviceid}, userinfo={self.userinfo})>"
 
 
 class TokenBlacklist(Base):

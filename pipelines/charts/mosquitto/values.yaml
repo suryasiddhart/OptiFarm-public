@@ -1,0 +1,71 @@
+# -- Namespace to deploy Mosquitto into
+namespace: optifarm-dev
+
+# -- Environment name; selects the Key Vault secrets (e.g. mqtt-admin-password-dev)
+environment: dev
+
+image:
+  # -- Mosquitto image
+  repository: eclipse-mosquitto
+  tag: 2.1.2-alpine
+  pullPolicy: IfNotPresent
+
+# -- The initContainer that writes dynamic-security.json from appschema.devices
+# runs ingest/dynsec_sync.py from the ingest image
+syncImage:
+  repository: acroptifarm.azurecr.io/ingest
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: acr-pull-secret
+
+# -- Device-facing TLS listener on 8883, exposed on the VM through a
+# LoadBalancer Service (k3s ServiceLB). Only one environment runs on the VM
+# at a time, so every environment uses 8883.
+tls:
+  enabled: true
+  # -- Public hostname devices connect to (set by the deploy pipeline,
+  # e.g. mqtt.<vm-ip>.sslip.io); a Let's Encrypt certificate is issued for it
+  host: ""
+  # -- cert-manager ClusterIssuer (HTTP-01 through ingress-nginx)
+  clusterIssuer: letsencrypt
+
+# -- Expose the broker outside the cluster (LoadBalancer Service): 8883 when
+# tls.enabled, otherwise plain 1883 (local machine only — no encryption).
+external:
+  enabled: true
+
+# -- Largest MQTT packet the broker accepts (bytes). Keep below Kafka's
+# 1 MB message limit; larger grids are sent in parts with the same ts.
+maxPacketSize: 900000
+
+service:
+  # -- In-cluster plain MQTT listener (bridge, API admin client, simulator)
+  port: 1883
+
+persistence:
+  # -- Queued QoS 1 messages for persistent sessions (the bridge) survive restarts
+  size: 1Gi
+  storageClassName: local-path
+
+resources:
+  requests:
+    cpu: "50m"
+    memory: "64Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+
+externalSecret:
+  # -- Create the ExternalSecret that syncs "mqtt-secrets" (admin + bridge
+  # passwords) from Key Vault. When disabled, create that Secret manually.
+  enabled: true
+  secretStore: azure-keyvault
+  refreshInterval: 1h
+
+# -- DATABASE_URL for the dynsec_sync initContainer, from the backend's
+# "optifarm-secrets" (deploy the backend chart first)
+databaseSecret:
+  name: optifarm-secrets
+  key: database-url

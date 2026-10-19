@@ -1,5 +1,5 @@
 import { Table, Tag, Button, Typography, Empty, Space } from "antd";
-import { PlusOutlined, EyeOutlined, ThunderboltOutlined } from "@ant-design/icons";
+import { PlusOutlined, EyeOutlined, ThunderboltOutlined, ApiOutlined } from "@ant-design/icons";
 import { useNavigate } from "react-router-dom";
 import type { Field } from "../../types";
 
@@ -8,9 +8,19 @@ const { Text } = Typography;
 interface FieldsTableProps {
   fields: Field[];
   loading: boolean;
+  // Active devices per field id
+  deviceCounts: Record<number, number>;
+  onViewDevices: (field: Field) => void;
+  onLiveView: (field: Field) => void;
 }
 
-export default function FieldsTable({ fields, loading }: FieldsTableProps) {
+export default function FieldsTable({
+  fields,
+  loading,
+  deviceCounts,
+  onViewDevices,
+  onLiveView,
+}: FieldsTableProps) {
   const navigate = useNavigate();
 
   const columns = [
@@ -66,6 +76,23 @@ export default function FieldsTable({ fields, loading }: FieldsTableProps) {
         ),
     },
     {
+      title: "Devices",
+      key: "devices",
+      render: (_: unknown, record: Field) => {
+        const count = deviceCounts[record.fieldid] ?? 0;
+        return (
+          <Space size={4}>
+            <Tag color={count ? "blue" : "default"} data-testid="device-count">
+              {count}
+            </Tag>
+            <Button type="link" size="small" icon={<ApiOutlined />} onClick={() => onViewDevices(record)}>
+              View devices
+            </Button>
+          </Space>
+        );
+      },
+    },
+    {
       title: "Actions",
       key: "actions",
       render: (_: unknown, record: Field) => (
@@ -80,7 +107,7 @@ export default function FieldsTable({ fields, loading }: FieldsTableProps) {
           <Button
             type="link"
             icon={<EyeOutlined />}
-            onClick={() => navigate(`/fields/${record.fieldid}/live`)}
+            onClick={() => onLiveView(record)}
           >
             Live View
           </Button>
@@ -124,7 +151,7 @@ export default function FieldsTable({ fields, loading }: FieldsTableProps) {
           ),
         }}
         pagination={false}
-        scroll={{ x: 700 }}
+        scroll={{ x: 900 }}
       />
     </div>
   );

@@ -1,16 +1,20 @@
 # FarmApp — Deploy to k3s (stage template)
 #
 # Deploys the TimescaleDB, backend and frontend Helm charts plus the shared
-# ingress into the optifarm-<envName> namespace of the k3s cluster.
+# ingress into the optifarm-<envName> namespace of the k3s cluster. With
+# ingestionEnabled it also deploys field-device ingestion: Kafka, Mosquitto
+# (TLS on port 8883) and the MQTT→Kafka bridge / Kafka→DB consumer.
 #
 # Prerequisites (created by the infrastructure pipeline):
 #   - Key Vault secret "kubeconfig-<envName>" (kubeconfig for the k3s VM)
 #   - Namespace optifarm-<envName>, External Secrets Operator, the
 #     "azure-keyvault" ClusterSecretStore and the "acr-pull-secret" ExternalSecret
 #   - Key Vault secrets postgres-user/-password-<envName>, jwt-secret-key-<envName>
+#     (+ mqtt-admin-password-<envName>, mqtt-bridge-password-<envName> for ingestion)
+#   - NSG rule for port 8883 (infrastructure/terraform/modules/vm)
 #
 # Pipeline variables used: key_vault_name, containerRegistry,
-#   imageRepositoryBackend, imageRepositoryFrontend, tag
+#   imageRepositoryBackend, imageRepositoryFrontend, imageRepositoryIngest, tag
 
 parameters:
   - name: stageName
@@ -47,6 +51,14 @@ parameters:
   - name: armServiceConnection
     type: string
     default: "terraform-arm-connection"
+  # Interactive API docs (/api/docs, /api/redoc, /api/openapi.json)
+  - name: apiDocsEnabled
+    type: boolean
+    default: true
+  # Field-device ingestion (Kafka, Mosquitto, bridge, consumer, /devices API)
+  - name: ingestionEnabled
+    type: boolean
+    default: false
 
 stages:
   - stage: ${{ parameters.stageName }}
@@ -95,6 +107,15 @@ stages:
                       chmod 600 "$KUBECONFIG"
                       kubectl get nodes -o wide
 
+                      # Public hostnames derive from the k3s API server IP
+                      VM_IP=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' \
+                        | sed -E 's#^https?://([^:/]+).*#\1#')
+                      export INGRESS_HOST="${{ parameters.ingressHostPrefix }}${VM_IP}.${{ parameters.ingressDomain }}"
+                      export CLUSTER_ISSUER="${{ parameters.clusterIssuer }}"
+                      MQTT_HOST="mqtt.${INGRESS_HOST}"
+                      INGESTION=$(echo "${{ parameters.ingestionEnabled }}" | tr '[:upper:]' '[:lower:]')
+                      API_DOCS=$(echo "${{ parameters.apiDocsEnabled }}" | tr '[:upper:]' '[:lower:]')
+
                       # ── TimescaleDB (credentials synced from Key Vault by ESO) ──
                       helm upgrade --install timescaledb "$CHARTS/timescaledb" \
                         --namespace "$(namespace)" \
@@ -111,6 +132,8 @@ stages:
                         --set environment="${{ parameters.envName }}" \
                         --set image.repository="$(containerRegistry)/$(imageRepositoryBackend)" \
                         --set image.tag="$(tag)" \
+                        --set mqtt.enabled="${INGESTION}" \
+                        --set apiDocs.enabled="${API_DOCS}" \
                         --wait --timeout 5m
 
                       # Schema migrations ran in the "migrate" initContainer (alembic upgrade head)
@@ -122,6 +145,35 @@ stages:
                         --for=condition=Ready --timeout=180s
                       kubectl get externalsecret -n "$(namespace)"
 
+                      # ── Field-device ingestion ──
+                      if [ "${INGESTION}" = "true" ]; then
+                        helm upgrade --install kafka "$CHARTS/kafka" \
+                          --namespace "$(namespace)" \
+                          --set namespace="$(namespace)" \
+                          --wait --timeout 5m
+
+                        # dynsec-sync initContainer builds broker credentials from
+                        # appschema.devices (migrated above by the backend release)
+                        helm upgrade --install mosquitto "$CHARTS/mosquitto" \
+                          --namespace "$(namespace)" \
+                          --set namespace="$(namespace)" \
+                          --set environment="${{ parameters.envName }}" \
+                          --set syncImage.repository="$(containerRegistry)/$(imageRepositoryIngest)" \
+                          --set syncImage.tag="$(tag)" \
+                          --set tls.host="${MQTT_HOST}" \
+                          --set tls.clusterIssuer="${CLUSTER_ISSUER}" \
+                          --wait --timeout 8m
+
+                        helm upgrade --install ingest "$CHARTS/ingest" \
+                          --namespace "$(namespace)" \
+                          --set namespace="$(namespace)" \
+                          --set image.repository="$(containerRegistry)/$(imageRepositoryIngest)" \
+                          --set image.tag="$(tag)" \
+                          --wait --timeout 5m
+                      else
+                        echo "→ Field-device ingestion disabled for ${{ parameters.envName }}"
+                      fi
+
                       # ── Frontend ──
                       helm upgrade --install frontend "$CHARTS/frontend" \
                         --namespace "$(namespace)" \
@@ -130,11 +182,7 @@ stages:
                         --set image.tag="$(tag)" \
                         --wait --timeout 5m
 
-                      # ── Shared HTTPS ingress (host derived from the k3s API server IP) ──
-                      VM_IP=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' \
-                        | sed -E 's#^https?://([^:/]+).*#\1#')
-                      export INGRESS_HOST="${{ parameters.ingressHostPrefix }}${VM_IP}.${{ parameters.ingressDomain }}"
-                      export CLUSTER_ISSUER="${{ parameters.clusterIssuer }}"
+                      # ── Shared HTTPS ingress ──
                       echo "→ Ingress host: ${INGRESS_HOST} (issuer: ${CLUSTER_ISSUER})"
                       envsubst '${INGRESS_HOST} ${CLUSTER_ISSUER}' < "$(Build.SourcesDirectory)/pipelines/manifests/ingress.yml" \
                         | kubectl apply -n "$(namespace)" -f -
@@ -185,4 +233,16 @@ stages:
                         exit 1
                       fi
                       echo "✓ Auth endpoints rate limited (${LIMITED}/40 requests got 429)"
+
+                      if [ "${INGESTION}" = "true" ]; then
+                        kubectl rollout status deploy/mqtt-bridge -n "$(namespace)" --timeout=120s
+                        kubectl rollout status deploy/ingest-consumer -n "$(namespace)" --timeout=120s
+                        kubectl wait certificate/mqtt-tls -n "$(namespace)" --for=condition=Ready --timeout=120s
+                        if timeout 10 bash -c "</dev/tcp/${MQTT_HOST}/8883"; then
+                          echo "✓ MQTT/TLS reachable at ${MQTT_HOST}:8883"
+                        else
+                          echo "✗ MQTT port 8883 not reachable on ${MQTT_HOST} (NSG rule?)"
+                          exit 1
+                        fi
+                      fi
                       echo "✓ Deployed to $(namespace) — https://${INGRESS_HOST}"

@@ -74,6 +74,25 @@ migrations:
       cpu: "250m"
       memory: "256Mi"
 
+# -- Interactive API docs (/api/docs, /api/redoc) and /api/openapi.json.
+# Turned off on the prod deploy stage (pipelines/azure-pipelines.yml).
+apiDocs:
+  enabled: true
+
+# -- Browser origins allowed to call the API cross-origin. Leave empty: the
+# frontend calls /api on its own host, which needs no CORS. Example for a
+# separate frontend: ["https://admin.example.com"]
+cors:
+  allowedOrigins: []
+
+# -- Field-device provisioning: the API pushes device credentials to Mosquitto
+# (dynamic-security admin). When enabled, "optifarm-secrets" also gets
+# mqtt-admin-password from Key Vault (mqtt-admin-password-<environment>).
+mqtt:
+  enabled: false
+  host: mosquitto
+  port: 1883
+
 externalSecret:
   # -- Create the ExternalSecret that syncs "optifarm-secrets" from Key Vault.
   # When disabled, create the "optifarm-secrets" Secret manually.
@@ -103,3 +122,7 @@ env:
     value: "v1.0.0"
   - name: DEBUG
     value: "false"
+  # The ingress serves the API under /api and strips the prefix; FastAPI needs
+  # it for Swagger UI (/api/docs loads /api/openapi.json) and "Try it out"
+  - name: ROOT_PATH
+    value: "/api"

@@ -1,0 +1,17 @@
+# In-cluster only, no authentication: reachable by pods in this namespace.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "kafka.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: kafka
+  ports:
+    - name: kafka
+      protocol: TCP
+      port: {{ .Values.service.port }}
+      targetPort: kafka
+  type: ClusterIP

@@ -6,9 +6,10 @@
 #
 # Stages (independent, run in parallel when agents are available):
 #   Backend      — compile, Bandit, unit tests, Alembic migration round-trip,
-#                  integration tests against TimescaleDB
+#                  integration tests against TimescaleDB; ingest + simulator
+#                  unit tests
 #   Frontend     — ESLint, TypeScript, Vitest, production build
-#   Images       — docker build of both images + Trivy image scan
+#   Images       — docker build of all images + Trivy image scan
 #   Security     — Gitleaks (PR commits), Semgrep SAST, Trivy dependency and
 #                  IaC (Helm/Terraform/Dockerfile) scans
 #   Manifests    — helm lint/template for all charts, ingress render check
@@ -50,6 +51,7 @@ variables:
   trivyImage: aquasec/trivy:0.75.0
   gitleaksImage: zricethezav/gitleaks:v8.30.1
   semgrepImage: semgrep/semgrep:1.179.0
+  helmImage: alpine/helm:3.20.2
   # Throwaway test database (service container, never reachable outside the job)
   testDatabaseUrl: "postgresql://testuser:testpass@postgres:5432/farmapp_test"
   # Dummy value — only satisfies Settings() validation in tests
@@ -117,6 +119,48 @@ stages:
               failTaskOnFailedTests: true
           - publish: api/coverage.xml
             artifact: coverage-backend-unit
+            displayName: "Publish coverage artifact"
+            condition: succeededOrFailed()
+
+      - job: IngestUnit
+        displayName: "Ingest & Simulator — Compile, Bandit & Unit Tests"
+        container: python
+        strategy:
+          matrix:
+            ingest:
+              component: ingest
+            simulator:
+              component: simulator
+        steps:
+          - checkout: self
+          - script: |
+              set -euo pipefail
+              python -m venv "$(Agent.TempDirectory)/venv"
+              . "$(Agent.TempDirectory)/venv/bin/activate"
+              pip install --quiet --upgrade pip
+              pip install --quiet -r $(component)/requirements-dev.txt bandit==1.9.4
+            displayName: "Install Python dependencies"
+          - script: |
+              set -euo pipefail
+              . "$(Agent.TempDirectory)/venv/bin/activate"
+              cd $(component)
+              python -m compileall -q .
+              bandit -q -r . -x ./tests -lll
+              mkdir -p test-results
+              python -m pytest -m unit \
+                --junitxml=test-results/unit-results.xml \
+                --cov=. --cov-report=xml:coverage.xml
+            displayName: "Compile, Bandit & unit tests ($(component))"
+          - task: PublishTestResults@2
+            displayName: "Publish unit test results"
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: "$(component)/test-results/unit-*.xml"
+              testRunTitle: "$(component) Unit Tests"
+              failTaskOnFailedTests: true
+          - publish: $(component)/coverage.xml
+            artifact: coverage-$(component)-unit
             displayName: "Publish coverage artifact"
             condition: succeededOrFailed()
 
@@ -261,16 +305,20 @@ stages:
         variables:
           apiImage: "optifarm-api:pr-$(Build.BuildId)"
           frontendImage: "optifarm-frontend:pr-$(Build.BuildId)"
+          ingestImage: "optifarm-ingest:pr-$(Build.BuildId)"
+          simulatorImage: "optifarm-simulator:pr-$(Build.BuildId)"
         steps:
           - checkout: self
           - script: |
               set -euo pipefail
               docker build -t "$(apiImage)" api/
               docker build -t "$(frontendImage)" farmapp-frontend/
+              docker build -t "$(ingestImage)" ingest/
+              docker build -t "$(simulatorImage)" simulator/
             displayName: "Build images"
           - script: |
               set -euo pipefail
-              for image in "$(apiImage)" "$(frontendImage)"; do
+              for image in "$(apiImage)" "$(frontendImage)" "$(ingestImage)" "$(simulatorImage)"; do
                 echo "→ Scanning ${image}"
                 docker run --rm \
                   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -282,7 +330,7 @@ stages:
                   --exit-code 1 "${image}"
               done
             displayName: "Trivy image scan (HIGH/CRITICAL, fixable)"
-          - script: docker image rm -f "$(apiImage)" "$(frontendImage)" || true
+          - script: docker image rm -f "$(apiImage)" "$(frontendImage)" "$(ingestImage)" "$(simulatorImage)" || true
             displayName: "Remove PR images"
             condition: always()
 
@@ -333,7 +381,7 @@ stages:
           - script: |
               set -euo pipefail
               TRIVY="docker run --rm -v $(Build.SourcesDirectory):/src:ro -w /src -v trivy-cache:/root/.cache $(trivyImage)"
-              for target in api farmapp-frontend; do
+              for target in api ingest simulator farmapp-frontend; do
                 echo "→ Dependencies: ${target}"
                 $TRIVY fs --scanners vuln \
                   --severity HIGH,CRITICAL --ignore-unfixed \
@@ -361,22 +409,28 @@ stages:
     jobs:
       - job: HelmAndIngress
         displayName: "helm lint/template & ingress render"
-        container: python
+        # Helm runs from a pinned image like the scanners: nothing is installed on
+        # the agent (HelmInstaller@1 needs unzip, which the slim containers lack).
         steps:
           - checkout: self
-          - task: HelmInstaller@1
-            displayName: "Install Helm"
-            inputs:
-              helmVersionToInstall: latest
           - script: |
               set -euo pipefail
-              for chart in timescaledb backend frontend; do
-                echo "→ ${chart}"
-                helm lint "pipelines/charts/${chart}" \
-                  --set environment=staging,namespace=optifarm-staging
-                helm template "${chart}" "pipelines/charts/${chart}" \
-                  --set environment=staging,namespace=optifarm-staging > /dev/null
-              done
+              docker run --rm -v "$(Build.SourcesDirectory):/src:ro" -w /src \
+                --entrypoint sh "$(helmImage)" -euc '
+                helm version --short
+                for chart in timescaledb backend frontend kafka mosquitto ingest simulator; do
+                  # Per-chart values that the deploy pipeline normally supplies
+                  case "$chart" in
+                    backend)   extra="--set mqtt.enabled=true" ;;
+                    mosquitto) extra="--set tls.host=mqtt.203.0.113.10.sslip.io" ;;
+                    simulator) extra="--set devices[0].deviceid=dev-001,devices[0].field_length=2,devices[0].field_breadth=2,devices[0].crop_interval=0.1 --set devices[1].deviceid=dev-002,devices[1].field_length=1,devices[1].field_breadth=1,devices[1].crop_interval=0.25,devices[1].send_ts=false" ;;
+                    *)         extra="" ;;
+                  esac
+                  echo "→ $chart"
+                  helm lint "pipelines/charts/$chart" --set environment=staging,namespace=optifarm-staging $extra
+                  helm template "$chart" "pipelines/charts/$chart" \
+                    --set environment=staging,namespace=optifarm-staging $extra > /dev/null
+                done'
             displayName: "helm lint & template"
           # Same substitution the deploy pipeline does with envsubst
 

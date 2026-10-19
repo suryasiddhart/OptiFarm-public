@@ -1,101 +1,75 @@
-import { useRef, useEffect, useCallback } from "react";
+import { useRef, useEffect, useCallback, useMemo } from "react";
 import { moistureToColor, moistureLabel } from "../../utils/heatmapColor";
+import { cellAtPoint, cellOrigin, heatmapLayout } from "../../utils/heatmapLayout";
 import type { SensorGrid } from "../../types";
 
 interface HeatmapCanvasProps {
   grid: SensorGrid;
-  fieldLength: number;
-  fieldBreadth: number;
 }
 
-export default function HeatmapCanvas({
-  grid,
-  fieldLength,
-  fieldBreadth,
-}: HeatmapCanvasProps) {
+/**
+ * The moisture grid as a matrix: row numbers down the left, column numbers
+ * across the top (both 1-based), so reading key m2_5 is drawn at row 2,
+ * column 5. Rows run along the field's length, columns along its breadth.
+ */
+export default function HeatmapCanvas({ grid }: HeatmapCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
-
-  const CELL_SIZE = 60;
-  const PADDING = 20;
-  const GAP = 2;
-
-  const canvasWidth = grid.cols * (CELL_SIZE + GAP) + PADDING * 2;
-  const canvasHeight = grid.rows * (CELL_SIZE + GAP) + PADDING * 2;
+  const layout = useMemo(() => heatmapLayout(grid.rows, grid.cols), [grid.rows, grid.cols]);
 
   const drawGrid = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx) return;
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    // Clear canvas
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    // Draw background
     ctx.fillStyle = "#f5f5f5";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Draw each cell
+    const { cellSize } = layout;
+    const half = cellSize / 2;
+
+    // Column numbers across the top, row numbers down the left
+    ctx.fillStyle = "#555";
+    ctx.font = `${cellSize >= 40 ? 12 : 10}px sans-serif`;
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "center";
+    for (let c = 0; c < grid.cols; c++) {
+      const { x } = cellOrigin(layout, 0, c);
+      ctx.fillText(String(c + 1), x + half, layout.originY - 12);
+    }
+    ctx.textAlign = "right";
+    for (let r = 0; r < grid.rows; r++) {
+      const { y } = cellOrigin(layout, r, 0);
+      ctx.fillText(String(r + 1), layout.originX - 6, y + half);
+    }
+
     for (let r = 0; r < grid.rows; r++) {
       for (let c = 0; c < grid.cols; c++) {
         const cell = grid.cells[r]?.[c];
-        const x = PADDING + c * (CELL_SIZE + GAP);
-        const y = PADDING + r * (CELL_SIZE + GAP);
+        const { x, y } = cellOrigin(layout, r, c);
 
-        const color = moistureToColor(cell?.moisture ?? null);
-
-        // Draw cell rectangle
-        ctx.fillStyle = color;
-        ctx.fillRect(x, y, CELL_SIZE, CELL_SIZE);
-
-        // Draw border
+        ctx.fillStyle = moistureToColor(cell?.moisture ?? null);
+        ctx.fillRect(x, y, cellSize, cellSize);
         ctx.strokeStyle = "#e0e0e0";
         ctx.lineWidth = 1;
-        ctx.strokeRect(x, y, CELL_SIZE, CELL_SIZE);
+        ctx.strokeRect(x, y, cellSize, cellSize);
 
-        // Draw moisture value text if available
+        if (!layout.showValues) continue;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
         if (cell?.moisture !== null && cell?.moisture !== undefined) {
           ctx.fillStyle = "#fff";
-          ctx.font = "bold 14px sans-serif";
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          ctx.fillText(
-            `${Math.round(cell.moisture)}%`,
-            x + CELL_SIZE / 2,
-            y + CELL_SIZE / 2
-          );
+          ctx.font = `bold ${cellSize >= 60 ? 14 : 12}px sans-serif`;
+          ctx.fillText(`${Math.round(cell.moisture)}%`, x + half, y + half);
         } else {
           ctx.fillStyle = "#999";
           ctx.font = "11px sans-serif";
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          ctx.fillText("N/A", x + CELL_SIZE / 2, y + CELL_SIZE / 2);
+          ctx.fillText("N/A", x + half, y + half);
         }
       }
     }
-
-    // Draw dimension labels
-    ctx.fillStyle = "#333";
-    ctx.font = "12px sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "top";
-    ctx.fillText(
-      `${fieldLength}m`,
-      canvas.width / 2,
-      canvas.height - 5
-    );
-
-    // Rotate and draw breadth label
-    ctx.save();
-    ctx.translate(5, canvas.height / 2);
-    ctx.rotate(-Math.PI / 2);
-    ctx.textAlign = "center";
-    ctx.textBaseline = "bottom";
-    ctx.fillText(`${fieldBreadth}m`, 0, 0);
-    ctx.restore();
-  }, [grid, fieldLength, fieldBreadth]);
+  }, [grid, layout]);
 
   useEffect(() => {
     drawGrid();
@@ -109,28 +83,23 @@ export default function HeatmapCanvas({
     const rect = canvas.getBoundingClientRect();
     const mouseX = e.clientX - rect.left;
     const mouseY = e.clientY - rect.top;
+    const position = cellAtPoint(layout, mouseX, mouseY);
+    const cell = position && grid.cells[position.row]?.[position.col];
 
-    // Calculate which cell the mouse is over
-    const col = Math.floor((mouseX - PADDING) / (CELL_SIZE + GAP));
-    const row = Math.floor((mouseY - PADDING) / (CELL_SIZE + GAP));
-
-    if (row >= 0 && row < grid.rows && col >= 0 && col < grid.cols) {
-      const cell = grid.cells[row][col];
-      if (cell) {
-        tooltip.style.display = "block";
-        tooltip.style.left = `${e.clientX - rect.left + 10}px`;
-        tooltip.style.top = `${e.clientY - rect.top - 40}px`;
-        tooltip.innerHTML = `
-          <strong>Cell [${row + 1}, ${col + 1}]</strong><br/>
-          Moisture: ${cell.moisture !== null ? Math.round(cell.moisture) + "%" : "N/A"}<br/>
-          Status: ${moistureLabel(cell.moisture)}<br/>
-          ${cell.deviceid ? `Device: ${cell.deviceid}<br/>` : ""}
-          ${cell.timestamp ? `Time: ${new Date(cell.timestamp).toLocaleTimeString()}` : ""}
-        `;
-        return;
-      }
+    if (position && cell) {
+      tooltip.style.display = "block";
+      tooltip.style.left = `${mouseX + 10}px`;
+      tooltip.style.top = `${mouseY - 40}px`;
+      tooltip.innerHTML = `
+        <strong>m${position.row + 1}_${position.col + 1}</strong>
+        (row ${position.row + 1}, column ${position.col + 1})<br/>
+        Moisture: ${cell.moisture !== null ? cell.moisture + "%" : "N/A"}<br/>
+        Status: ${moistureLabel(cell.moisture)}<br/>
+        ${cell.deviceid ? `Device: ${cell.deviceid}<br/>` : ""}
+        ${cell.timestamp ? `Time: ${new Date(cell.timestamp).toLocaleString()}` : ""}
+      `;
+      return;
     }
-
     tooltip.style.display = "none";
   };
 
@@ -144,10 +113,13 @@ export default function HeatmapCanvas({
     <div style={{ position: "relative", display: "inline-block" }}>
       <canvas
         ref={canvasRef}
-        width={canvasWidth}
-        height={canvasHeight}
+        width={layout.width}
+        height={layout.height}
         onMouseMove={handleMouseMove}
         onMouseLeave={handleMouseLeave}
+        aria-label={`Soil moisture grid, ${grid.rows} rows by ${grid.cols} columns`}
+        role="img"
+        data-testid="moisture-heatmap"
         style={{
           border: "1px solid #d9d9d9",
           borderRadius: 8,
@@ -156,6 +128,7 @@ export default function HeatmapCanvas({
       />
       <div
         ref={tooltipRef}
+        data-testid="moisture-heatmap-tooltip"
         style={{
           display: "none",
           position: "absolute",

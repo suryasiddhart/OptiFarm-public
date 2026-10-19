@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simulator
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "simulator.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    # Device client IDs are fixed; two copies would keep disconnecting each other
+    type: Recreate
+  selector:
+    matchLabels:
+      app: simulator
+  template:
+    metadata:
+      labels:
+        app: simulator
+      annotations:
+        checksum/devices: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: simulator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: MQTT_HOST
+              value: {{ .Values.mqtt.host | quote }}
+            - name: MQTT_PORT
+              value: {{ .Values.mqtt.port | quote }}
+            - name: MQTT_TLS
+              value: {{ .Values.mqtt.tls | quote }}
+            - name: MQTT_CA_FILE
+              value: {{ .Values.mqtt.caFile | quote }}
+            - name: MQTT_TOPIC_PREFIX
+              value: {{ .Values.mqtt.topicPrefix | quote }}
+            - name: MQTT_QOS
+              value: {{ .Values.mqtt.qos | quote }}
+            - name: SIMULATOR_INTERVAL_SECONDS
+              value: {{ .Values.intervalSeconds | quote }}
+            - name: SIMULATOR_DEVICES_FILE
+              value: /config/devices.yaml
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            {{- range $i, $d := .Values.devices }}
+            - name: PASSKEY_{{ $i }}
+              valueFrom:
+                secretKeyRef:
+                  name: simulator-passkeys
+                  key: passkey-{{ $i }}
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: devices
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: devices
+          configMap:
+            name: simulator-devices

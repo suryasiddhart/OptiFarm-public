@@ -237,3 +237,13 @@ crash.log
 override.tf
 override.tf.json
 .terraform.lock.hcl
+
+
+# install-k3s-stack-local.yml
+# hosts.ini
+# ingress-local.yml
+# deploy-local.sh
+docker-compose.ingest.yml
+
+# Simulator local device list (contains passkeys)
+simulator/devices.yaml

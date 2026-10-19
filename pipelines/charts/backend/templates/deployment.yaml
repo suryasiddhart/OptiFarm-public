@@ -41,6 +41,21 @@ spec:
               name: http
           env:
             {{- toYaml .Values.env | nindent 12 }}
+            {{- if .Values.mqtt.enabled }}
+            - name: MQTT_HOST
+              value: {{ .Values.mqtt.host | quote }}
+            - name: MQTT_PORT
+              value: {{ .Values.mqtt.port | quote }}
+            - name: MQTT_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: optifarm-secrets
+                  key: mqtt-admin-password
+            {{- end }}
+            - name: API_DOCS_ENABLED
+              value: {{ .Values.apiDocs.enabled | quote }}
+            - name: CORS_ORIGINS
+              value: {{ join "," .Values.cors.allowedOrigins | quote }}
           livenessProbe:
             httpGet:
               path: {{ .Values.probes.liveness.path }}

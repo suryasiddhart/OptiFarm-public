@@ -1,0 +1,95 @@
+# FarmApp — Deploy the device data simulator (stage template)
+#
+# Only included by azure-pipelines.yml when the run's `deploySimulator`
+# parameter is checked. Deploys pipelines/charts/simulator into
+# optifarm-<envName> after that environment's normal deploy stage.
+#
+# Prerequisites:
+#   - Field-device ingestion enabled for the environment (Mosquitto running)
+#   - pipelines/charts/simulator/values-<envName>.yaml listing the devices,
+#     with each passkey in Key Vault (see pipelines/charts/simulator/README.md)
+#
+# Pipeline variables used: key_vault_name, containerRegistry,
+#   imageRepositorySimulator, tag
+
+parameters:
+  - name: envName            # dev | staging
+    type: string
+  - name: dependsOn          # the environment's deploy stage
+    type: string
+  - name: armServiceConnection
+    type: string
+    default: "terraform-arm-connection"
+
+stages:
+  - stage: DeploySimulator
+    displayName: "Deploy simulator (optifarm-${{ parameters.envName }})"
+    dependsOn:
+      - Build
+      - ${{ parameters.dependsOn }}
+    condition: and(succeeded('Build'), succeeded('${{ parameters.dependsOn }}'))
+    jobs:
+      - deployment: DeploySimulator
+        displayName: "Helm deploy simulator"
+        pool:
+          name: Exp-Agent
+        environment: ${{ parameters.envName }}
+        variables:
+          namespace: "optifarm-${{ parameters.envName }}"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: KubectlInstaller@0
+                  inputs:
+                    kubectlVersion: 'latest'
+
+                - task: HelmInstaller@1
+                  inputs:
+                    helmVersionToInstall: 'latest'
+
+                - task: AzureCLI@2
+                  displayName: "Helm deploy simulator to optifarm-${{ parameters.envName }}"
+                  inputs:
+                    azureSubscription: ${{ parameters.armServiceConnection }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      CHART="$(Build.SourcesDirectory)/pipelines/charts/simulator"
+                      VALUES="${CHART}/values-${{ parameters.envName }}.yaml"
+                      export KUBECONFIG="$(Agent.TempDirectory)/kubeconfig"
+                      trap 'rm -f "$KUBECONFIG"' EXIT
+
+                      az keyvault secret show \
+                        --vault-name "$(key_vault_name)" \
+                        --name "kubeconfig-${{ parameters.envName }}" \
+                        --query value -o tsv > "$KUBECONFIG"
+                      chmod 600 "$KUBECONFIG"
+
+                      if ! kubectl get service mosquitto -n "$(namespace)" >/dev/null 2>&1; then
+                        echo "✗ No Mosquitto in $(namespace): enable ingestion for ${{ parameters.envName }} first"
+                        exit 1
+                      fi
+                      if [ ! -f "$VALUES" ]; then
+                        echo "✗ Missing ${VALUES#$(Build.SourcesDirectory)/} (simulated device list)"
+                        exit 1
+                      fi
+
+                      helm upgrade --install simulator "$CHART" \
+                        --namespace "$(namespace)" \
+                        --set namespace="$(namespace)" \
+                        --set environment="${{ parameters.envName }}" \
+                        --set image.repository="$(containerRegistry)/$(imageRepositorySimulator)" \
+                        --set image.tag="$(tag)" \
+                        -f "$VALUES" \
+                        --wait --timeout 5m
+
+                      kubectl wait externalsecret/simulator-passkeys -n "$(namespace)" \
+                        --for=condition=Ready --timeout=120s
+                      kubectl rollout status deploy/simulator -n "$(namespace)" --timeout=120s
+                      sleep 15
+                      kubectl logs deploy/simulator -n "$(namespace)" --tail=20
+                      echo "✓ Simulator running in $(namespace). Remove with: helm uninstall simulator -n $(namespace)"

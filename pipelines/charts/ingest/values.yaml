@@ -1,0 +1,55 @@
+# -- Namespace to deploy the ingest services into
+namespace: optifarm-dev
+
+image:
+  # -- Ingest image (ingest/Dockerfile): bridge.py, consumer.py, dynsec_sync.py
+  repository: acroptifarm.azurecr.io/ingest
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: acr-pull-secret
+
+mqtt:
+  host: mosquitto
+  port: 1883
+
+kafka:
+  bootstrapServers: kafka:9092
+  telemetryTopic: telemetry.raw
+  dlqTopic: telemetry.dlq
+
+consumer:
+  # -- More replicas share the topic's partitions (each partition is read by
+  # one consumer, so per-device order is kept); max useful = partition count
+  replicaCount: 1
+  batchMaxMessages: 500
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "96Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
+bridge:
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "500m"
+      memory: "192Mi"
+
+logLevel: INFO
+
+# -- Secrets created by other charts in the same namespace
+secrets:
+  # backend chart (ExternalSecret "optifarm-secrets")
+  database:
+    name: optifarm-secrets
+    key: database-url
+  # mosquitto chart (ExternalSecret "mqtt-secrets")
+  bridgePassword:
+    name: mqtt-secrets
+    key: bridge-password

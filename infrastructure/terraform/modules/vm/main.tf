@@ -123,6 +123,21 @@ resource "azurerm_network_security_group" "nsg" {
     source_address_prefix      = "*"
     destination_address_prefix = "*"
   }
+
+  # MQTT over TLS for field devices (Mosquitto via k3s ServiceLB):
+  # one environment per VM, so 8883 serves whichever is deployed.
+  # Plain MQTT (1883) stays in-cluster.
+  security_rule {
+    name                       = "MQTTS"
+    priority                   = 1040
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "8883"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
 }
 
 # ─────────────────────────────────────────────

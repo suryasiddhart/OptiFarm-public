@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mosquitto
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "mosquitto.labels" . | nindent 4 }}
+spec:
+  serviceName: mosquitto
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mosquitto
+  template:
+    metadata:
+      labels:
+        app: mosquitto
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        # The mosquitto user: owns the dynsec file it rewrites on every change
+        runAsUser: 1883
+        runAsGroup: 1883
+        runAsNonRoot: true
+        fsGroup: 1883
+      initContainers:
+        # Rebuild credentials from the database on every start: the devices
+        # table is the source of truth for who may connect.
+        - name: dynsec-sync
+          image: "{{ .Values.syncImage.repository }}:{{ .Values.syncImage.tag }}"
+          imagePullPolicy: {{ .Values.syncImage.pullPolicy }}
+          command: ["python", "dynsec_sync.py", "/mosquitto/dynsec/dynamic-security.json"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.databaseSecret.name }}
+                  key: {{ .Values.databaseSecret.key }}
+            - name: MQTT_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mqtt-secrets
+                  key: admin-password
+            - name: MQTT_BRIDGE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mqtt-secrets
+                  key: bridge-password
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: dynsec
+              mountPath: /mosquitto/dynsec
+      containers:
+        - name: mosquitto
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["mosquitto", "-c", "/mosquitto/config/mosquitto.conf"]
+          ports:
+            - name: mqtt
+              containerPort: {{ .Values.service.port }}
+            {{- if .Values.tls.enabled }}
+            - name: mqtts
+              containerPort: 8883
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            tcpSocket:
+              port: mqtt
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            tcpSocket:
+              port: mqtt
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /mosquitto/config
+              readOnly: true
+            - name: dynsec
+              mountPath: /mosquitto/dynsec
+            - name: data
+              mountPath: /mosquitto/data
+            {{- if .Values.tls.enabled }}
+            - name: certs
+              mountPath: /mosquitto/certs
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: mosquitto-config
+        - name: dynsec
+          emptyDir: {}
+        - name: data
+          persistentVolumeClaim:
+            claimName: mosquitto-data
+        {{- if .Values.tls.enabled }}
+        - name: certs
+          secret:
+            secretName: mqtt-tls
+            defaultMode: 0440
+        {{- end }}

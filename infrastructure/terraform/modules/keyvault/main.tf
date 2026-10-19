@@ -52,12 +52,29 @@ resource "random_password" "jwt_secret_key" {
   special  = false
 }
 
+# Mosquitto system clients: "admin" (the API pushes device credentials with it)
+# and "bridge" (MQTT → Kafka). Device passkeys are not here: they are issued
+# per device by the API and only their hashes are stored (appschema.devices).
+resource "random_password" "mqtt_admin" {
+  for_each = toset(var.app_environments)
+  length   = 40
+  special  = false
+}
+
+resource "random_password" "mqtt_bridge" {
+  for_each = toset(var.app_environments)
+  length   = 40
+  special  = false
+}
+
 locals {
   app_secrets = merge([
     for env in var.app_environments : {
-      "postgres-user-${env}"     = var.app_db_username
-      "postgres-password-${env}" = random_password.postgres[env].result
-      "jwt-secret-key-${env}"    = random_password.jwt_secret_key[env].result
+      "postgres-user-${env}"        = var.app_db_username
+      "postgres-password-${env}"    = random_password.postgres[env].result
+      "jwt-secret-key-${env}"       = random_password.jwt_secret_key[env].result
+      "mqtt-admin-password-${env}"  = random_password.mqtt_admin[env].result
+      "mqtt-bridge-password-${env}" = random_password.mqtt_bridge[env].result
     }
   ]...)
 }
