@@ -1,0 +1,27 @@
+{{- if not .Values.devices }}
+{{- fail "simulator: set at least one entry in .Values.devices (see values.yaml)" }}
+{{- end }}
+# Device list for simulator/main.py. Passkeys are not here: each device reads
+# its passkey from env var PASSKEY_<index> (Secret "simulator-passkeys").
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: simulator-devices
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "simulator.labels" . | nindent 4 }}
+data:
+  devices.yaml: |
+    devices:
+    {{- range $i, $d := .Values.devices }}
+      - deviceid: {{ required "every device needs a deviceid" $d.deviceid | quote }}
+        passkey_env: PASSKEY_{{ $i }}
+        {{- range $key := list "field_length" "field_breadth" "crop_interval" }}
+        {{ $key }}: {{ required (printf "device %s needs %s (its field's size; sets the moisture grid)" $d.deviceid $key) (index $d $key) }}
+        {{- end }}
+        {{- range $key := list "max_cells_per_message" "cell_spread" "interval_seconds" "send_ts" "start" "min" "max" "seed" }}
+        {{- if hasKey $d $key }}
+        {{ $key }}: {{ index $d $key }}
+        {{- end }}
+        {{- end }}
+    {{- end }}

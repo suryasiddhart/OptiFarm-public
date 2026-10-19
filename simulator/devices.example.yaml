@@ -1,0 +1,26 @@
+# Simulated devices for local runs (docker-compose.ingest.yml --profile sim,
+# scripts/deploy-local.sh --simulator). Register each device first
+# (POST /devices/ with the field it belongs to) and paste the returned deviceid
+# and passkey. Copy to devices.yaml (gitignored: it holds passkeys).
+#
+# field_length / field_breadth / crop_interval must match that field in the
+# app: the device sends one moisture value per grid cell, and the grid is
+# floor(length / interval) rows x floor(breadth / interval) columns.
+#
+# Instead of an inline passkey, `passkey_env: SOME_VAR` reads it from an
+# environment variable (the Helm chart does this with Key Vault secrets).
+devices:
+  - deviceid: dev-001
+    passkey: "<passkey from POST /devices/>"
+    field_length: 2
+    field_breadth: 2
+    crop_interval: 0.1     # 20 x 20 = 400 cells
+    interval_seconds: 30
+  - deviceid: dev-002
+    passkey: "<passkey from POST /devices/>"
+    field_length: 1
+    field_breadth: 1
+    crop_interval: 0.25    # 4 x 4 = 16 cells
+    interval_seconds: 60
+    send_ts: false         # behave like a device without a real-time clock
+    start: 22              # starting moisture %

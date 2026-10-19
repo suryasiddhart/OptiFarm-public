@@ -53,6 +53,22 @@ class Settings(BaseSettings):
     debug: bool = True
     host: str = "0.0.0.0"
     port: int = 8000
+    # Public path prefix when served behind a proxy that strips it (the ingress
+    # routes /api/* to the API as /*). Empty when the API is reached directly.
+    root_path: str = ""
+
+    # Interactive API docs (/docs, /redoc) and the schema (/openapi.json).
+    # Disabled in prod: the schema is a full map of the API.
+    api_docs_enabled: bool = True
+
+    # Browser origins allowed to call the API cross-origin, comma-separated
+    # (e.g. "http://localhost:5173"). Empty = no cross-origin access, which is
+    # right for every deployment: the frontend calls /api on its own host.
+    cors_origins: str = ""
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     # Database
     # SECURITY: MUST be set via env var DATABASE_URL or .env file.
@@ -77,6 +93,16 @@ class Settings(BaseSettings):
     # after login_max_attempts failed logins (see services/login_attempt_service.py)
     login_max_attempts: int = 5
     login_lockout_minutes: int = 15
+
+    # MQTT broker admin (Mosquitto dynamic-security) used to push device
+    # credentials when devices are created / rotated / disabled.
+    # MQTT_ADMIN_PASSWORD comes from Key Vault (mqtt-admin-password-<env>);
+    # when it is empty, the /devices endpoints that touch the broker return 503.
+    mqtt_host: str = "mosquitto"
+    mqtt_port: int = 1883
+    mqtt_admin_username: str = "admin"
+    mqtt_admin_password: str = ""
+    mqtt_admin_timeout_seconds: float = 5.0
 
     model_config = SettingsConfigDict(
         env_file="../.env" if _should_load_env_file() else None,

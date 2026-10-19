@@ -1,0 +1,40 @@
+# -- Namespace to deploy Kafka into
+namespace: optifarm-dev
+
+image:
+  # -- Apache Kafka (KRaft, no ZooKeeper)
+  repository: apache/kafka
+  tag: 4.1.1
+  pullPolicy: IfNotPresent
+
+# -- KRaft cluster ID (any base64 UUID; keep it stable once data exists)
+clusterId: "b3B0aWZhcm0ta2Fma2EwMQ"
+
+# -- JVM heap; keep the memory limit ~1.5x the max heap
+heapOpts: "-Xms512m -Xmx768m"
+
+storage:
+  size: 5Gi
+  storageClassName: local-path
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "768Mi"
+  limits:
+    cpu: "1"
+    memory: "1280Mi"
+
+service:
+  port: 9092
+
+# -- Topics created (idempotently) by a post-install/upgrade Job
+topics:
+  - name: telemetry.raw
+    # Messages are keyed by deviceid, so each device's readings stay ordered
+    # within one partition; partitions cap how many consumers can share the load.
+    partitions: 6
+    retentionMs: 604800000      # 7 days of replay
+  - name: telemetry.dlq
+    partitions: 1
+    retentionMs: 2592000000     # 30 days to investigate rejected messages

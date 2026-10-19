@@ -14,7 +14,6 @@ import RegisterPage from "./pages/RegisterPage";
 import FieldsPage from "./pages/FieldsPage";
 import AddFieldPage from "./pages/AddFieldPage";
 import InferencePage from "./pages/InferencePage";
-import LiveViewPage from "./pages/LiveViewPage";
 
 // Protected route wrapper
 function ProtectedRoute() {
@@ -83,7 +82,6 @@ function AppRoutes() {
           <Route path="/fields" element={<FieldsPage />} />
           <Route path="/fields/add" element={<AddFieldPage />} />
           <Route path="/fields/:fieldId/inference" element={<InferencePage />} />
-          <Route path="/fields/:fieldId/live" element={<LiveViewPage />} />
         </Route>
       </Route>
 

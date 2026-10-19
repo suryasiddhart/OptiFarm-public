@@ -1,0 +1,67 @@
+# -- Namespace to deploy the simulator into
+namespace: optifarm-dev
+
+# -- Environment name; used in default Key Vault secret names
+environment: dev
+
+image:
+  repository: acroptifarm.azurecr.io/simulator
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: acr-pull-secret
+
+# -- Broker connection. Defaults point at the Mosquitto service in the same
+# namespace (plain in-cluster listener). To go through the public endpoint:
+# host=mqtt.<vm-ip>.sslip.io, port=8883, tls=true.
+mqtt:
+  host: mosquitto
+  port: 1883
+  tls: false
+  # -- CA bundle path inside the container; empty = system CAs (Let's Encrypt)
+  caFile: ""
+  topicPrefix: optifarm/v1/devices
+  qos: 1
+
+# -- Default publish interval for devices that don't set interval_seconds
+intervalSeconds: 60
+
+# -- Simulated devices. Register each with POST /api/devices/ first and store
+# the returned passkey in Key Vault (default secret name:
+# simulator-<deviceid>-<environment>, or set passkeySecret). Example:
+# field_length / field_breadth / crop_interval are required and must match the
+# device's field in the app (grid = floor(length/interval) x floor(breadth/interval)).
+#   devices:
+#     - deviceid: dev-001
+#       field_length: 2
+#       field_breadth: 2
+#       crop_interval: 0.1      # 20 x 20 cells
+#       interval_seconds: 30
+#     - deviceid: dev-002
+#       field_length: 1
+#       field_breadth: 1
+#       crop_interval: 0.25
+#       send_ts: false          # device without a clock
+#       start: 22               # starting moisture %
+#       min: 10
+#       max: 40
+#       passkeySecret: my-kv-secret-name
+devices: []
+
+resources:
+  requests:
+    cpu: "20m"
+    memory: "64Mi"
+  limits:
+    cpu: "250m"
+    memory: "128Mi"
+
+logLevel: INFO
+
+externalSecret:
+  # -- Sync device passkeys from Key Vault into "simulator-passkeys".
+  # When disabled, create that Secret manually (keys: passkey-0, passkey-1, ...).
+  enabled: true
+  secretStore: azure-keyvault
+  refreshInterval: 1h

@@ -1,0 +1,16 @@
+{{- if .Values.tls.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: mqtt-tls
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "mosquitto.labels" . | nindent 4 }}
+spec:
+  secretName: mqtt-tls
+  dnsNames:
+    - {{ required "tls.host is required when tls.enabled (e.g. mqtt.<vm-ip>.sslip.io)" .Values.tls.host | quote }}
+  issuerRef:
+    kind: ClusterIssuer
+    name: {{ .Values.tls.clusterIssuer }}
+{{- end }}

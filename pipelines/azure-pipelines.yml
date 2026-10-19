@@ -6,6 +6,11 @@
 # This pipeline assumes tests & scans already passed via PR validation.
 # It focuses on: Build Docker images → Push to ACR → Helm deploy to k3s.
 #
+# Field-device ingestion (Kafka, Mosquitto, bridge, consumer) is deployed to
+# environments with ingestionEnabled (dev only for now). The device data
+# simulator is NOT part of normal runs: queue the pipeline manually with
+# "Deploy device data simulator" checked (templates/deploy-simulator.yml).
+#
 # Deploy stages use templates/deploy-k3s.yml. Required in variable group
 # `optifarm-variables`:
 #   - key_vault_name — Key Vault holding kubeconfig-<env> (e.g. optifarm-kv1)
@@ -23,11 +28,25 @@ trigger:
   paths:
     include:
       - api/*
+      - ingest/*
       - farmapp-frontend/*
       - pipelines/*
       - db/*
 
 pr: none
+
+parameters:
+  - name: deploySimulator
+    displayName: "Deploy device data simulator"
+    type: boolean
+    default: false
+  - name: simulatorEnvironment
+    displayName: "Simulator environment (needs ingestion enabled there)"
+    type: string
+    default: dev
+    values:
+      - dev
+      - staging
 
 variables:
   - group: optifarm-variables  # Azure Library variable group
@@ -37,12 +56,20 @@ variables:
     value: "api"
   - name: imageRepositoryFrontend
     value: "frontend"
+  - name: imageRepositoryIngest
+    value: "ingest"
+  - name: imageRepositorySimulator
+    value: "simulator"
   - name: containerRegistry
     value: "acroptifarm.azurecr.io"
   - name: dockerfilePathBackend
     value: "$(Build.SourcesDirectory)/api/Dockerfile"
   - name: dockerfilePathFrontend
     value: "$(Build.SourcesDirectory)/farmapp-frontend/Dockerfile"
+  - name: dockerfilePathIngest
+    value: "$(Build.SourcesDirectory)/ingest/Dockerfile"
+  - name: dockerfilePathSimulator
+    value: "$(Build.SourcesDirectory)/simulator/Dockerfile"
   - name: tag
     value: $(Build.BuildId)
 
@@ -104,6 +131,53 @@ stages:
               tags: |
                 $(tag)
 
+      - job: BuildIngest
+        displayName: "Build and push Ingest Image (bridge, consumer, dynsec-sync)"
+        pool:
+          name: Exp-Agent
+        steps:
+          - checkout: self
+
+          - task: Docker@2
+            displayName: "Login to ACR"
+            inputs:
+              command: login
+              containerRegistry: $(dockerRegistryServiceConnection)
+
+          - task: Docker@2
+            displayName: "Build & Push Ingest"
+            inputs:
+              command: buildAndPush
+              repository: $(imageRepositoryIngest)
+              dockerfile: $(dockerfilePathIngest)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+
+      - ${{ if eq(parameters.deploySimulator, true) }}:
+          - job: BuildSimulator
+            displayName: "Build and push Simulator Image"
+            pool:
+              name: Exp-Agent
+            steps:
+              - checkout: self
+
+              - task: Docker@2
+                displayName: "Login to ACR"
+                inputs:
+                  command: login
+                  containerRegistry: $(dockerRegistryServiceConnection)
+
+              - task: Docker@2
+                displayName: "Build & Push Simulator"
+                inputs:
+                  command: buildAndPush
+                  repository: $(imageRepositorySimulator)
+                  dockerfile: $(dockerfilePathSimulator)
+                  containerRegistry: $(dockerRegistryServiceConnection)
+                  tags: |
+                    $(tag)
+
 
   # ─────────────────────────────────────────────────────────
   # STAGE 2: Deploy to k3s (dev → staging → prod)
@@ -114,6 +188,7 @@ stages:
       displayName: "Deploy to Development"
       envName: dev
       environment: "dev"
+      ingestionEnabled: true
       # condition: |
       #   and(
       #     succeeded(),
@@ -127,6 +202,7 @@ stages:
       envName: staging
       environment: "staging"
       ingressHostPrefix: "staging."
+      ingestionEnabled: false
       condition: |
         and(
           succeeded(),
@@ -140,8 +216,22 @@ stages:
       envName: prod
       environment: "prod"
       ingressHostPrefix: "prod."
+      ingestionEnabled: false
+      apiDocsEnabled: false        # no public Swagger UI / OpenAPI schema in prod
       condition: |
         and(
           succeeded(),
           startsWith(variables['Build.SourceBranch'], 'refs/tags/v')
         )
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 3 (on demand): device data simulator
+  # ─────────────────────────────────────────────────────────
+  - ${{ if eq(parameters.deploySimulator, true) }}:
+      - template: templates/deploy-simulator.yml
+        parameters:
+          envName: ${{ parameters.simulatorEnvironment }}
+          ${{ if eq(parameters.simulatorEnvironment, 'staging') }}:
+            dependsOn: DeployStaging
+          ${{ else }}:
+            dependsOn: DeployDev

@@ -1,15 +1,20 @@
 # OptiFarm (FarmApp)
 
-A precision-irrigation platform for monitoring soil moisture across farm fields, built as a full-stack MVP and delivered end to end through Azure DevOps.
+OptiFarm is a precision-irrigation platform. Farmers register their fields, attach soil-moisture sensors to them, and watch the moisture of every part of each field update live on a grid, so they can see which areas need water.
 
-The application itself is deliberately small: a FastAPI backend, a React frontend, and TimescaleDB. The real substance of this repository is the delivery platform around it: **Terraform and Ansible infrastructure automation**, a **blocking PR build-validation pipeline** with layered security gates, and a **promotion-based CD pipeline** that deploys to Kubernetes with automated TLS, secretless credentials, and post-deploy smoke tests.
+- **Fields as grids.** Each field is divided into cells based on its size and crop spacing: rows = length ÷ crop interval, columns = breadth ÷ crop interval. A 2 m × 2 m field with 0.1 m spacing is a 20 × 20 grid.
+- **Devices.** Each field can have several devices. A device is registered in the app, gets a one-time passkey, and reports the moisture of the field's cells over MQTT.
+- **Live View.** A heatmap of the field shows the latest moisture of every cell, refreshed every 15 seconds.
+
+The repository contains both the application (a React frontend, a FastAPI backend, TimescaleDB, and an MQTT → Kafka ingestion pipeline for device data) and the platform that delivers it: **Terraform and Ansible infrastructure automation**, a **blocking PR build-validation pipeline** with layered security gates, and a **promotion-based CD pipeline** that deploys to Kubernetes with automated TLS, secretless credentials, and post-deploy smoke tests.
 
 ---
 
 ## Contents
 
+- [Application architecture](#application-architecture)
 - [Highlights](#highlights)
-- [Architecture](#architecture)
+- [Delivery architecture](#delivery-architecture)
 - [Repository layout](#repository-layout)
 - [Tech stack](#tech-stack)
 - [Infrastructure automation](#infrastructure-automation)
@@ -18,9 +23,58 @@ The application itself is deliberately small: a FastAPI backend, a React fronten
 - [Secrets management](#secrets-management)
 - [Database migrations](#database-migrations)
 - [HTTPS](#https)
+- [Field-device ingestion](#field-device-ingestion)
 - [Azure DevOps setup](#azure-devops-setup)
 - [Local development](#local-development)
 - [Known limitations and roadmap](#known-limitations-and-roadmap)
+
+---
+
+## Application architecture
+
+```
+                 Browser                                        Field devices (sensors)
+                    │ HTTPS 443                                        │ MQTT over TLS 8883
+                    ▼                                                  │ user = device ID, password = passkey
+            ┌──────────────┐                                           ▼
+            │ ingress-nginx│                                   ┌──────────────┐   logins rebuilt from the
+            └──┬────────┬──┘                                   │  Mosquitto   │◄─ devices table on start
+       /       │        │ /api                                 │ (MQTT broker)│   (dynsec-sync)
+               ▼        ▼                                      └──────┬───────┘
+      ┌──────────┐  ┌───────────────┐  creates / rotates / disables   │ optifarm/v1/devices/<id>/telemetry
+      │ frontend │  │  api          │──── device logins ─────────────►│
+      │ React +  │  │  FastAPI      │                                 ▼
+      │ nginx    │  │  JWT auth     │                          ┌──────────────┐
+      └──────────┘  └──────┬────────┘                          │ mqtt-bridge  │
+                           │ SQL                               └──────┬───────┘
+                           ▼                                          ▼  key = device ID (keeps order)
+                    ┌──────────────────┐                       ┌──────────────┐  telemetry.raw
+                    │   TimescaleDB    │                       │ Kafka        │  telemetry.dlq (rejects)
+                    │ users · fields · │                       └──────┬───────┘
+                    │ devices ·        │                              ▼
+                    │ moisturedata     │◄──────────────────────┌──────────────────┐
+                    └──────────────────┘   batch upserts       │ ingest-consumer  │
+                                                               └──────────────────┘
+```
+
+| Component | Role |
+|---|---|
+| **frontend** (`farmapp-frontend/`) | React + Ant Design, served by nginx. My Fields list, a devices popup per field (add, rotate passkey, delete), and the Live View heatmap popup. Calls the API on the same host under `/api`. |
+| **api** (`api/`) | FastAPI. User registration and JWT login, fields, devices, and moisture queries. When a device is created, rotated or deleted, it updates that device's broker login immediately. |
+| **TimescaleDB** | PostgreSQL with TimescaleDB. Holds users, fields, devices (with a hash of each device's passkey) and `moisturedata`, a hypertable with one row per device per time. |
+| **Mosquitto** | MQTT broker for devices. Each device can only publish to its own topic. Logins are rebuilt from the `devices` table every time the broker starts. |
+| **mqtt-bridge** (`ingest/bridge.py`) | Forwards device messages to Kafka, keyed by device ID. It acknowledges a message to the broker only after Kafka has stored it, so nothing is lost if it restarts. |
+| **Kafka** | Durable buffer between devices and the database. `telemetry.raw` holds incoming data (7 days); `telemetry.dlq` holds rejected messages with the reason. |
+| **ingest-consumer** (`ingest/consumer.py`) | Validates messages, checks the cells against the device's field grid, and writes them to `moisturedata`. Duplicates are merged, and invalid messages go to the DLQ. |
+| **simulator** (`simulator/`, optional) | Simulated devices that publish realistic moisture grids. Deployed only on request. |
+
+**Main flows**
+1. **Register a field:** the user enters its size and crop interval, which fixes its grid (rows × columns).
+2. **Add a device:** the user names it in the field's devices popup. The API stores the device with a hash of a newly generated passkey, creates its broker login, and shows the device ID and passkey **once**.
+3. **Report moisture:** the device publishes `{"ts": "...", "readings": {"moisture": {"m1_1": 31.4, "m2_5": 28.9}}}`, where `m<row>_<col>` names a grid cell (1-based). The reading flows broker → bridge → Kafka → consumer → `moisturedata`. A large grid can be sent in parts that share a timestamp.
+4. **View:** Live View loads the field's readings and places each value in its cell, so `m2_5` appears at row 2, column 5. Each cell shows its newest value.
+
+Details of the message format, validation and ordering are in [Field-device ingestion](#field-device-ingestion). Each environment (dev, staging, prod) runs this whole stack in its own Kubernetes namespace; the device-ingestion part is switched on per environment.
 
 ---
 
@@ -34,7 +88,9 @@ The application itself is deliberately small: a FastAPI backend, a React fronten
 
 ---
 
-## Architecture
+## Delivery architecture
+
+How code gets from a pull request to the running environments:
 
 ```
                          ┌──────────────────────── Azure DevOps ────────────────────────┐
@@ -56,7 +112,7 @@ The application itself is deliberately small: a FastAPI backend, a React fronten
    │  Spot VM ── k3s ─┬─ ingress-nginx  ─ cert-manager (Let's Encrypt, HTTP-01)         │
    │                  ├─ External Secrets Operator ── managed identity ──► Key Vault/ACR│
    │                  └─ namespaces: optifarm-dev | optifarm-staging | optifarm-prod    │
-   │                       each: frontend (nginx) · api (FastAPI) · timescaledb         │
+   │                       each: frontend · api · timescaledb (+ device ingestion)      │
    └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -77,6 +133,9 @@ Each environment is a namespace with its own database, secrets, and hostname. Fo
 │   ├── src/components/LiveView/ sensor grid and soil-moisture heatmap
 │   ├── docker/                  runtime config injection (API_BASE_URL)
 │   └── tests/unit|e2e/          Vitest and Playwright
+├── ingest/                      device telemetry: bridge.py (MQTT→Kafka), consumer.py
+│                                (Kafka→TimescaleDB), dynsec_sync.py (broker credentials)
+├── simulator/                   simulated field devices publishing to MQTT
 ├── db/                          SQLAlchemy models (schema owned by Alembic)
 ├── infrastructure/
 │   ├── azure-pipelines.yml      infrastructure pipeline (Terraform + Ansible)
@@ -85,8 +144,9 @@ Each environment is a namespace with its own database, secrets, and hostname. Fo
 ├── pipelines/
 │   ├── pr-validation.yml        PR build validation
 │   ├── azure-pipelines.yml      CI/CD (build, push, deploy)
-│   ├── templates/deploy-k3s.yml reusable deploy stage
-│   ├── charts/                  Helm charts: backend, frontend, timescaledb
+│   ├── templates/               deploy-k3s.yml (per env), deploy-simulator.yml (on demand)
+│   ├── charts/                  Helm charts: backend, frontend, timescaledb,
+│   │                            kafka, mosquitto, ingest, simulator
 │   └── manifests/ingress.yml    shared HTTPS ingress
 ├── .gitleaks.toml               secret-scan allowlist
 └── .trivyignore.yaml            time-boxed risk acceptances
@@ -271,6 +331,34 @@ To troubleshoot: `kubectl describe certificate,order,challenge -n optifarm-<env>
 
 ---
 
+## Field-device ingestion
+
+```
+device ──MQTT/TLS──► Mosquitto ──► mqtt-bridge ──► Kafka telemetry.raw ──► ingest-consumer ──► moisturedata
+         deviceid +               (key = deviceid)  (6 partitions)          (batch upsert,     (hypertable)
+         passkey                                    telemetry.dlq ◄──────── commit after DB)
+```
+
+- **Devices** are registered with `POST /api/devices/` (optionally with a `fieldid`). Every device belongs to the calling user. The response contains the device's **passkey once**; only its PBKDF2-SHA512 hash is stored in `appschema.devices`. `POST /api/devices/{id}/rotate-passkey` issues a new one and `DELETE /api/devices/{id}` disables the device.
+- **Broker credentials** are kept in step with that table. The API pushes each change to the running broker straight away (Mosquitto dynamic-security, `$CONTROL/dynamic-security/v1`), and on every broker start the `dynsec-sync` initContainer rebuilds the full config from the database.
+- **MQTT contract:** username = `deviceid`, password = passkey; a device can only publish to `optifarm/v1/devices/<deviceid>/telemetry`. Payload: `{"ts": "2026-10-12T10:00:00Z", "readings": {"moisture": {"m1_1": 31.4, "m1_2": 32.34}}}`. `ts` is optional (the bridge's receive time is used without it); `{"batch": [...]}` sends several timestamped readings at once. Use QoS 1.
+- **Moisture grid:** every device is assigned to a field (`fieldid` is required; `PATCH /api/devices/{id}` moves it). A reading holds one value per grid cell of that field, keyed `m<row>_<col>` (1-based), with rows = floor(fieldlength / cropinterval) and cols = floor(fieldbreadth / cropinterval); a 2 × 2 m field at 0.1 m spacing is 20 × 20 cells. Any subset of cells may be sent, and cells sent again with the same `ts` are merged into that reading, so large grids can be split across messages (the broker accepts up to 900 kB per message). Cells outside the grid send the message to the DLQ. Readings from before this format are kept in `moisture_legacy`.
+- **Ordering and duplicates:** messages are keyed by device ID, so each device's readings stay in order in one partition. Rows are unique on `(deviceid, rtctime)` and inserted with `ON CONFLICT DO NOTHING`, so redeliveries are harmless. The bridge acknowledges MQTT messages only after Kafka has them, and the consumer commits Kafka offsets only after the database commit.
+- **Rejected messages** (invalid JSON or schema, implausible timestamps, unknown or disabled devices) go to `telemetry.dlq` with the reason in the `error` header.
+- **Environments:** ingestion is enabled per deploy stage (`ingestionEnabled`, dev only for now). Devices connect to `mqtt.<ingress-host>` on port 8883 with a Let's Encrypt certificate. Only one environment runs on the VM at a time, so they all use 8883. Before enabling an environment, apply Terraform so Key Vault has `mqtt-admin-password-<env>` and `mqtt-bridge-password-<env>` and the NSG allows 8883.
+- **Simulator:** not deployed by normal runs. Queue the CD pipeline with **Deploy device data simulator** checked (dev or staging). Devices and their Key Vault passkeys are listed in `pipelines/charts/simulator/values-<env>.yaml`; see `pipelines/charts/simulator/README.md`.
+
+Run the whole flow locally with Docker:
+
+```bash
+docker compose -f docker-compose.ingest.yml up -d --build      # API on :8000, MQTT on :1883
+# register a user and devices via http://localhost:8000/docs, then:
+cp simulator/devices.example.yaml simulator/devices.yaml       # fill in deviceids + passkeys
+docker compose -f docker-compose.ingest.yml --profile sim up -d simulator
+```
+
+---
+
 ## Azure DevOps setup
 
 One-time configuration that lives in Azure DevOps rather than in code:
@@ -296,6 +384,10 @@ For Azure Repos Git, the `pr:` block in YAML is ignored. The branch policy decid
 ```bash
 # Backend unit tests (no database needed)
 cd api && pip install -r requirements-dev.txt && ./scripts/run-unit-tests.sh
+
+# Ingest / simulator unit tests
+cd ingest && pip install -r requirements-dev.txt && python -m pytest
+cd simulator && pip install -r requirements-dev.txt && python -m pytest
 
 # Backend integration tests (needs DATABASE_URL pointing at a TimescaleDB/PostgreSQL)
 ./scripts/run-integration-tests.sh

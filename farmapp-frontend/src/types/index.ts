@@ -65,11 +65,36 @@ export interface Field {
 // ─── Moisture Types ──────────────────────────────────────────────────────────
 
 export interface MoistureReading {
-  moisture: number;
+  // One value per grid cell, keyed m<row>_<col> (1-based), e.g. { m1_1: 31.4 }.
+  // null for readings stored before the grid format.
+  moisture: Record<string, number> | null;
   rtctime: string;
   deviceid: string;
   userinfo: number;
   fieldid: number | null;
+}
+
+// ─── Device Types ────────────────────────────────────────────────────────────
+
+export interface Device {
+  deviceid: string; // generated; also the MQTT username
+  devicename: string; // display name chosen by the user
+  userinfo: number;
+  fieldid: number | null;
+  status: "active" | "disabled";
+  last_seen: string | null;
+  created_at: string;
+}
+
+// Returned only by create and rotate-passkey: the passkey is never stored
+export interface DeviceCredentials extends Device {
+  passkey: string; // MQTT password
+  mqtt_topic: string;
+}
+
+export interface DeviceCreatePayload {
+  devicename: string;
+  fieldid: number;
 }
 
 // ─── Grid / Heatmap Types ────────────────────────────────────────────────────

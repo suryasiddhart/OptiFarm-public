@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mosquitto-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "mosquitto.labels" . | nindent 4 }}
+data:
+  mosquitto.conf: |
+    per_listener_settings false
+    allow_anonymous false
+
+    persistence true
+    persistence_location /mosquitto/data/
+
+    # Largest accepted MQTT packet (bytes): below Kafka's 1 MB message limit,
+    # so the bridge can always forward what the broker accepts
+    max_packet_size {{ .Values.maxPacketSize }}
+
+    # Credentials/ACLs: generated from appschema.devices by the dynsec-sync
+    # initContainer, then updated live by the API ($CONTROL/dynamic-security/v1)
+    plugin /usr/lib/mosquitto_dynamic_security.so
+    plugin_opt_config_file /mosquitto/dynsec/dynamic-security.json
+
+    # In-cluster only (ClusterIP service)
+    listener {{ .Values.service.port }}
+    {{- if .Values.tls.enabled }}
+
+    # Devices (LoadBalancer service, TLS). The pod restarts with the VM every
+    # night, which picks up renewed certificates.
+    listener 8883
+    certfile /mosquitto/certs/tls.crt
+    keyfile /mosquitto/certs/tls.key
+    {{- end }}
+
+    log_dest stdout
+    log_type error
+    log_type warning
+    log_type notice
+    log_type information

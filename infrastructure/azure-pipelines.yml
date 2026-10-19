@@ -406,6 +406,12 @@ stages:
 
                       # ── Run Ansible playbook ──
                       echo "→ Running Ansible playbook…"
+                      # The script is in the Terraform dir, so Ansible wouldn't find
+                      # infrastructure/ansible/ansible.cfg (host_key_checking = False) by itself.
+                      export ANSIBLE_CONFIG="$(ansibleDir)/ansible.cfg"
+                      # A recreated VM keeps its IP but gets a new host key; drop the one the
+                      # self-hosted agent remembered from the previous VM.
+                      ssh-keygen -R "${PUBLIC_IP}" >/dev/null 2>&1 || true
                       ansible-playbook -i /tmp/hosts.ini \
                         "$(ansibleDir)/playbooks/install-k3s-stack.yml" \
                         --extra-vars "public_ip=${PUBLIC_IP} key_vault_name=$(key_vault_name) eso_identity_client_id=${ESO_IDENTITY_CLIENT_ID} acr_login_server=${ACR_LOGIN_SERVER}" -vv
@@ -590,6 +596,12 @@ stages:
                       ${PUBLIC_IP} ansible_user=azureuser ansible_ssh_private_key_file=/tmp/vm_ssh_key
                       EOF
 
+                      # The script is in the Terraform dir, so Ansible wouldn't find
+                      # infrastructure/ansible/ansible.cfg (host_key_checking = False) by itself.
+                      export ANSIBLE_CONFIG="$(ansibleDir)/ansible.cfg"
+                      # A recreated VM keeps its IP but gets a new host key; drop the one the
+                      # self-hosted agent remembered from the previous VM.
+                      ssh-keygen -R "${PUBLIC_IP}" >/dev/null 2>&1 || true
                       ansible-playbook -i /tmp/hosts.ini "$(ansibleDir)/playbooks/install-k3s-stack.yml" --extra-vars "public_ip=${PUBLIC_IP} key_vault_name=$(key_vault_name) eso_identity_client_id=${ESO_IDENTITY_CLIENT_ID} acr_login_server=${ACR_LOGIN_SERVER}" -vv
 
                       KUBECONFIG_CONTENT=$(cat /tmp/kubeconfig.yaml)
@@ -742,6 +754,12 @@ stages:
                       ${PUBLIC_IP} ansible_user=azureuser ansible_ssh_private_key_file=/tmp/vm_ssh_key
                       EOF
 
+                      # The script is in the Terraform dir, so Ansible wouldn't find
+                      # infrastructure/ansible/ansible.cfg (host_key_checking = False) by itself.
+                      export ANSIBLE_CONFIG="$(ansibleDir)/ansible.cfg"
+                      # A recreated VM keeps its IP but gets a new host key; drop the one the
+                      # self-hosted agent remembered from the previous VM.
+                      ssh-keygen -R "${PUBLIC_IP}" >/dev/null 2>&1 || true
                       ansible-playbook -i /tmp/hosts.ini "$(ansibleDir)/playbooks/install-k3s-stack.yml" --extra-vars "public_ip=${PUBLIC_IP} key_vault_name=$(key_vault_name) eso_identity_client_id=${ESO_IDENTITY_CLIENT_ID} acr_login_server=${ACR_LOGIN_SERVER}" -vv
 
                       KUBECONFIG_CONTENT=$(cat /tmp/kubeconfig.yaml)
