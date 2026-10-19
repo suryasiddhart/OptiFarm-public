@@ -244,6 +244,7 @@ override.tf.json
 # ingress-local.yml
 # deploy-local.sh
 docker-compose.ingest.yml
+.trivyignore.yaml
 
 # Simulator local device list (contains passkeys)
 simulator/devices.yaml
